@@ -1,13 +1,16 @@
-# Observation Configuration
+# 观测配置（Observation Configuration）
 
-This page is the complete reference for configuring observations in the deployment system. It covers the YAML configuration format, the encoder system, every available observation type, and how to create your own custom observations.
+本页面是部署系统中观测（observations）配置的完整参考，涵盖 YAML 配置格式、编码器系统、所有可用观测类型，以及如何创建自定义观测。
 
-(obs-config-format)=
-## Configuration Format
+---
 
-Observations are configured via a YAML file passed with `--obs-config <path>`. Each observation has a `name` (must match a registered observation) and an `enabled` flag.
+## 配置格式
 
-### Basic Structure
+观测通过 `--obs-config <path>` 指定的 YAML 文件进行配置。每个观测包含一个 `name`（必须匹配已注册的观测）和一个 `enabled` 开关。
+
+---
+
+### 基础结构
 
 ```yaml
 observations:
@@ -27,24 +30,25 @@ observations:
     enabled: true
 ```
 
-**Key rules:**
+**关键规则：**
 
-- Observations are concatenated **in the order listed** to form the policy input vector.
-- Offsets are calculated automatically — no manual offset management needed.
-- The **total dimension** of all enabled observations must match your ONNX model's input size.
-- Disabled observations (`enabled: false`) are skipped entirely.
-- Reordering entries changes the layout of the input tensor (offsets shift accordingly).
+* 观测会按 YAML 中的顺序拼接，形成 policy 输入向量。
+* offset 自动计算，无需手动管理。
+* 所有启用观测的总维度必须与 ONNX 模型输入匹配。
+* `enabled: false` 的观测会被完全忽略。
+* 调整顺序会改变输入张量布局（offset 重新分配）。
 
-(obs-config-encoder)=
-### With Encoder (Token-Based Policies)
+---
 
-For policies that use an encoder to compress observations into a compact token, add an `encoder:` section:
+## 带编码器（Token-based Policy）
+
+如果 policy 使用 encoder 将观测压缩为 token，需要添加 `encoder:` 配置段。
 
 ```yaml
 observations:
-  - name: "token_state"           # Encoder outputs (dimension set below)
+  - name: "token_state"           # encoder 输出（维度见下）
     enabled: true
-  - name: "base_angular_velocity" # Direct observations
+  - name: "base_angular_velocity"
     enabled: true
   - name: "body_joint_positions"
     enabled: true
@@ -54,8 +58,8 @@ observations:
     enabled: true
 
 encoder:
-  dimension: 64       # Token output dimension
-  use_fp16: false     # TensorRT precision for encoder (optional)
+  dimension: 64       # token 输出维度
+  use_fp16: false     # TensorRT 精度（可选）
   encoder_observations:
     - name: "motion_joint_positions_10frame_step5"
       enabled: true
@@ -65,7 +69,7 @@ encoder:
       enabled: true
     - name: "motion_root_z_position_10frame_step5"
       enabled: true
-  encoder_modes:            # Optional: per-mode observation requirements
+  encoder_modes:
     - name: "g1"
       mode_id: 0
       required_observations:
@@ -75,363 +79,321 @@ encoder:
         - motion_root_z_position_10frame_step5
 ```
 
-**Encoder fields:**
+---
 
-| Field | Description |
-|---|---|
-| `dimension` | Token output dimension (must match encoder ONNX model output). Set to 0 or omit to disable encoder. |
-| `use_fp16` | Use FP16 precision for encoder TensorRT engine (default: false). |
-| `encoder_observations` | Observations fed to the encoder (superset of all modes). Same name/enabled format as policy observations. |
-| `encoder_modes` | *(Optional)* Per-mode observation requirements. Observations not in a mode's `required_observations` are zero-filled, saving computation. |
+### encoder 字段说明
 
-Run with `--encoder-file <path>` to load the encoder model. If omitted, `token_state` can be set externally via ROS2/ZMQ.
-
-See `policy/observation_config_example.yaml` for a complete annotated example.
-
-### Naming Convention
-
-Multi-frame observations follow the pattern: `{base_name}_{N}frame_step{S}`
-
-- **N** = number of frames gathered (temporal window size)
-- **S** = step size between frames (in control ticks at 50 Hz, so step5 = 0.1 s apart)
-- Without the suffix = single current frame only
-
-For example, `motion_joint_positions_10frame_step5` gathers 10 frames of joint positions, sampled every 5 ticks (0.1 s), giving a 0.9 s look-ahead window. If future frames exceed the motion length, the last frame is repeated.
+| 字段                     | 含义                                                   |
+| ---------------------- | ---------------------------------------------------- |
+| `dimension`            | token 输出维度，必须与 encoder ONNX 输出一致；为 0 或省略表示禁用 encoder |
+| `use_fp16`             | encoder TensorRT 是否使用 FP16（默认 false）                 |
+| `encoder_observations` | 输入 encoder 的观测集合（policy 观测的子集/超集）                    |
+| `encoder_modes`        | （可选）不同模式的观测需求配置                                      |
 
 ---
 
-## Encoder & Token Observations
+运行时使用：
 
-These observations relate to the encoder (tokenizer) system. See [With Encoder](obs-config-encoder) above for the YAML format.
-
-| Name | Dim | Description |
-|---|---|---|
-| `token_state` | config | Encoder output tokens (dimension set by `encoder.dimension` in YAML). Populated by local encoder inference or externally via ZMQ/ROS2. |
-| `encoder_mode` | 3 | Current encoder mode ID + 2 zero-padding values. |
-| `encoder_mode_4` | 4 | Current encoder mode ID + 3 zero-padding values. |
-
----
-
-## Motion Reference Observations
-
-Gathered from the currently-active motion sequence (reference motions, planner output, or ZMQ stream). All joint data uses **IsaacLab joint ordering** (29 joints).
-
-### Joint Positions (from motion)
-
-| Name | Dim | Frames | Step | Description |
-|---|---|---|---|---|
-| `motion_joint_positions` | 29 | 1 | — | Current frame joint positions (rad) |
-| `motion_joint_positions_3frame_step1` | 87 | 3 | 1 | 3-frame window, consecutive |
-| `motion_joint_positions_5frame_step5` | 145 | 5 | 5 | 5-frame window, 0.1 s apart |
-| `motion_joint_positions_10frame_step1` | 290 | 10 | 1 | 10-frame window, consecutive |
-| `motion_joint_positions_10frame_step5` | 290 | 10 | 5 | 10-frame window, 0.1 s apart |
-| `motion_joint_positions_lowerbody_10frame_step1` | 120 | 10 | 1 | Lower-body joints only (12 joints), consecutive |
-| `motion_joint_positions_lowerbody_10frame_step5` | 120 | 10 | 5 | Lower-body joints only, 0.1 s apart |
-| `motion_joint_positions_wrists_10frame_step1` | 60 | 10 | 1 | Wrist joints only (6 joints), consecutive |
-| `motion_joint_positions_wrists_2frame_step1` | 12 | 2 | 1 | Wrist joints only, 2 consecutive frames |
-
-```{note}
-When upper-body control is active (e.g., via ZMQ/ROS2 teleoperation), the upper-body joint positions in these observations are replaced with the externally-provided targets.
+```bash
+--encoder-file <path>
 ```
 
-### Joint Velocities (from motion)
-
-| Name | Dim | Frames | Step | Description |
-|---|---|---|---|---|
-| `motion_joint_velocities` | 29 | 1 | — | Current frame joint velocities (rad/s). Zero when not playing. |
-| `motion_joint_velocities_3frame_step1` | 87 | 3 | 1 | 3-frame window, consecutive |
-| `motion_joint_velocities_5frame_step5` | 145 | 5 | 5 | 5-frame window, 0.1 s apart |
-| `motion_joint_velocities_10frame_step1` | 290 | 10 | 1 | 10-frame window, consecutive |
-| `motion_joint_velocities_10frame_step5` | 290 | 10 | 5 | 10-frame window, 0.1 s apart |
-| `motion_joint_velocities_lowerbody_10frame_step1` | 120 | 10 | 1 | Lower-body joints only, consecutive |
-| `motion_joint_velocities_lowerbody_10frame_step5` | 120 | 10 | 5 | Lower-body joints only, 0.1 s apart |
-| `motion_joint_velocities_wrists_10frame_step1` | 60 | 10 | 1 | Wrist joints only, consecutive |
-
-### Anchor Orientation (from motion)
-
-Heading-corrected relative rotation from the robot's current base orientation to the reference motion orientation. Output is the first two columns of the 3×3 rotation matrix (6 values per frame).
-
-| Name | Dim | Frames | Step | Description |
-|---|---|---|---|---|
-| `motion_anchor_orientation` | 6 | 1 | — | Current frame anchor orientation (full base quaternion) |
-| `motion_anchor_orientation_10frame_step1` | 60 | 10 | 1 | 10-frame window, consecutive |
-| `motion_anchor_orientation_10frame_step5` | 60 | 10 | 5 | 10-frame window, 0.1 s apart |
-| `motion_anchor_orientation_heading` | 6 | 1 | — | Current frame, heading-only quaternion (yaw extracted from robot base) |
-| `motion_anchor_orientation_heading_10frame_step1` | 60 | 10 | 1 | Heading-only, 10-frame window, consecutive |
-| `motion_anchor_orientation_heading_10frame_step5` | 60 | 10 | 5 | Heading-only, 10-frame window, 0.1 s apart |
-| `motion_anchor_orientation_refheading` | 6 | 1 | — | Current frame, reference-heading quaternion (yaw from first future ref frame) |
-| `motion_anchor_orientation_refheading_10frame_step1` | 60 | 10 | 1 | Ref-heading, 10-frame window, consecutive |
-| `motion_anchor_orientation_refheading_10frame_step5` | 60 | 10 | 5 | Ref-heading, 10-frame window, 0.1 s apart |
-
-### Root Z Position (from motion)
-
-| Name | Dim | Frames | Step | Description |
-|---|---|---|---|---|
-| `motion_root_z_position` | 1 | 1 | — | Current frame root height (m) |
-| `motion_root_z_position_3frame_step1` | 3 | 3 | 1 | 3-frame window, consecutive |
-| `motion_root_z_position_10frame_step1` | 10 | 10 | 1 | 10-frame window, consecutive |
-| `motion_root_z_position_10frame_step5` | 10 | 10 | 5 | 10-frame window, 0.1 s apart |
+加载 encoder 模型。如果不提供，则 `token_state` 可以通过 ROS2/ZMQ 外部提供。
 
 ---
 
-## SMPL Observations
+### 命名规则
 
-Gathered from SMPL data in the motion sequence (optional — requires motions with `smpl_joint.csv` / `smpl_pose.csv`).
+多帧观测格式：
 
-### SMPL Joint Positions
+```
+{base_name}_{N}frame_step{S}
+```
 
-3D positions per SMPL joint (24 joints × 3 = 72 per frame).
+* **N**：帧数（时间窗口长度）
+* **S**：采样步长（控制 tick，50Hz → step5 = 0.1s）
+* 无后缀 = 单帧当前值
 
-| Name | Dim | Frames | Step | Description |
-|---|---|---|---|---|
-| `smpl_joints` | 72 | 1 | — | Current frame, all 24 SMPL joints |
-| `smpl_joints_2frame_step1` | 144 | 2 | 1 | 2 consecutive frames |
-| `smpl_joints_5frame_step5` | 360 | 5 | 5 | 5-frame window, 0.1 s apart |
-| `smpl_joints_10frame_step1` | 720 | 10 | 1 | 10-frame window, consecutive |
-| `smpl_joints_10frame_step5` | 720 | 10 | 5 | 10-frame window, 0.1 s apart |
-| `smpl_joints_lower_10frame_step1` | 270 | 10 | 1 | Lower-body SMPL joints only (9 joints), consecutive |
+例如：
 
-### SMPL Poses (Axis-Angle)
+`motion_joint_positions_10frame_step5`
 
-3D axis-angle per SMPL body part (21 poses × 3 = 63 per frame).
+表示：
 
-| Name | Dim | Frames | Step | Description |
-|---|---|---|---|---|
-| `smpl_pose` | 63 | 1 | — | Current frame, all 21 SMPL poses |
-| `smpl_pose_5frame_step5` | 315 | 5 | 5 | 5-frame window, 0.1 s apart |
-| `smpl_pose_10frame_step1` | 630 | 10 | 1 | 10-frame window, consecutive |
-| `smpl_pose_10frame_step5` | 630 | 10 | 5 | 10-frame window, 0.1 s apart |
-| `smpl_elbow_wrist_poses_10frame_step1` | 120 | 10 | 1 | Elbow + wrist poses only (4 parts), consecutive |
+* 10 帧
+* 每 5 tick 采样一次（0.1s）
+* 总覆盖约 0.9s 历史/未来窗口
 
-### SMPL Aliases
-
-These use the same gatherers as the motion observations but are intended for SMPL-based policies:
-
-| Name | Dim | Frames | Step | Description |
-|---|---|---|---|---|
-| `smpl_root_z_10frame_step1` | 10 | 10 | 1 | Root height, 10 consecutive frames |
-| `smpl_anchor_orientation_10frame_step1` | 60 | 10 | 1 | Anchor orientation, 10 consecutive frames |
-| `smpl_anchor_orientation_2frame_step1` | 12 | 2 | 1 | Anchor orientation, 2 consecutive frames |
+如果超出 motion 长度，会重复最后一帧。
 
 ---
 
-## VR Tracking Observations
+## Encoder & Token 观测
 
-VR 3-point and 5-point tracking data. When an external source (ZMQ/ROS2) provides VR data, buffered values are used directly. Otherwise, positions and orientations are computed from the motion sequence's body data and normalised to the root body frame.
-
-### VR 3-Point
-
-| Name | Dim | Description |
-|---|---|---|
-| `vr_3point_local_target` | 9 | 3-point positions in root frame: `[left_wrist xyz, right_wrist xyz, head xyz]` |
-| `vr_3point_local_target_compliant` | 9 | Same as above (identical during teleoperation) |
-| `vr_3point_local_orn_target` | 12 | 3-point orientations in root frame: `[left quat wxyz, right quat wxyz, head quat wxyz]` |
-| `vr_3point_compliance` | 3 | Compliance values: `[left_arm, right_arm, head]`. Keyboard-controlled (g/h/b/v keys), range [0.0, 0.5]. |
-
-### VR 5-Point
-
-| Name | Dim | Description |
-|---|---|---|
-| `vr_5point_local_target` | 15 | 5-point positions in root frame: `[left_wrist, right_wrist, head, left_ankle, right_ankle]` × xyz |
-| `vr_5point_local_orn_target` | 20 | 5-point orientations in root frame: 5 quaternions × wxyz |
+| 名称               | 维度     | 说明                                                |
+| ---------------- | ------ | ------------------------------------------------- |
+| `token_state`    | config | encoder 输出 token（维度由 YAML `encoder.dimension` 决定） |
+| `encoder_mode`   | 3      | 当前 encoder mode ID + padding                      |
+| `encoder_mode_4` | 4      | mode ID + padding                                 |
 
 ---
 
-## Robot State History Observations
+## Motion Reference 观测
 
-Gathered from the StateLogger ring buffer (measured sensor data from the real robot). These provide temporal context by sampling past states.
-
-### Single-Frame (Current State)
-
-| Name | Dim | Description |
-|---|---|---|
-| `base_angular_velocity` | 3 | IMU angular velocity (rad/s): `[roll_rate, pitch_rate, yaw_rate]` |
-| `body_joint_positions` | 29 | Current joint positions from encoders (rad, IsaacLab order) |
-| `body_joint_velocities` | 29 | Current joint velocities from encoders (rad/s, IsaacLab order) |
-| `last_actions` | 29 | Previous policy output (normalised action values) |
-| `gravity_dir` | 3 | Gravity direction in body frame (computed from base IMU quaternion) |
-
-### Multi-Frame History (4 frames, step 1)
-
-| Name | Dim | Description |
-|---|---|---|
-| `his_body_joint_positions_4frame_step1` | 116 | Joint positions: 4 consecutive ticks (29 × 4) |
-| `his_body_joint_velocities_4frame_step1` | 116 | Joint velocities: 4 consecutive ticks |
-| `his_last_actions_4frame_step1` | 116 | Past actions: 4 consecutive ticks |
-| `his_base_angular_velocity_4frame_step1` | 12 | Angular velocity: 4 consecutive ticks (3 × 4) |
-| `his_gravity_dir_4frame_step1` | 12 | Gravity direction: 4 consecutive ticks |
-
-### Multi-Frame History (10 frames, step 1)
-
-| Name | Dim | Description |
-|---|---|---|
-| `his_body_joint_positions_10frame_step1` | 290 | Joint positions: 10 consecutive ticks (29 × 10) |
-| `his_body_joint_velocities_10frame_step1` | 290 | Joint velocities: 10 consecutive ticks |
-| `his_last_actions_10frame_step1` | 290 | Past actions: 10 consecutive ticks |
-| `his_base_angular_velocity_10frame_step1` | 30 | Angular velocity: 10 consecutive ticks (3 × 10) |
-| `his_gravity_dir_10frame_step1` | 30 | Gravity direction: 10 consecutive ticks |
+来自当前 motion sequence（reference / planner / ZMQ stream）。所有 joint 使用 IsaacLab 的 29 关节顺序。
 
 ---
 
-## Creating Custom Observations
+### 关节位置（Joint Positions）
 
-You can add your own observation types by modifying the C++ source. The observation system is built around a **registry pattern** — you write a gatherer function, register it with a name and dimension, and then use that name in your YAML config.
+| 名称                                               | 维度  | 帧数 | 步长 | 说明      |
+| ------------------------------------------------ | --- | -- | -- | ------- |
+| `motion_joint_positions`                         | 29  | 1  | -  | 当前关节位置  |
+| `motion_joint_positions_3frame_step1`            | 87  | 3  | 1  | 连续 3 帧  |
+| `motion_joint_positions_5frame_step5`            | 145 | 5  | 5  | 0.1s 间隔 |
+| `motion_joint_positions_10frame_step1`           | 290 | 10 | 1  | 连续 10 帧 |
+| `motion_joint_positions_10frame_step5`           | 290 | 10 | 5  | 0.1s 间隔 |
+| `motion_joint_positions_lowerbody_10frame_step1` | 120 | 10 | 1  | 下半身关节   |
+| `motion_joint_positions_wrists_10frame_step1`    | 60  | 10 | 1  | 手腕关节    |
 
-All observation code lives in `gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/src/g1_deploy_onnx_ref.cpp` inside the `G1Deploy` class.
+```note
+当开启上半身 teleoperation（ZMQ/ROS2）时，上半身关节会被外部输入覆盖。
+```
 
-### Step 1: Write a Gatherer Function
+---
 
-A gatherer function reads from internal state (sensor data, motion data, etc.) and writes its output into a target buffer at a given offset. The signature is:
+### 关节速度（Joint Velocities）
+
+| 名称                                      | 维度  | 帧数 | 步长 |
+| --------------------------------------- | --- | -- | -- |
+| `motion_joint_velocities`               | 29  | 1  | -  |
+| `motion_joint_velocities_3frame_step1`  | 87  | 3  | 1  |
+| `motion_joint_velocities_5frame_step5`  | 145 | 5  | 5  |
+| `motion_joint_velocities_10frame_step1` | 290 | 10 | 1  |
+| `motion_joint_velocities_10frame_step5` | 290 | 10 | 5  |
+
+---
+
+### Anchor 姿态
+
+表示相对基座的旋转（6D rotation matrix 前两列）。
+
+| 名称                                        | 维度 |
+| ----------------------------------------- | -- |
+| `motion_anchor_orientation`               | 6  |
+| `motion_anchor_orientation_10frame_step1` | 60 |
+| `motion_anchor_orientation_10frame_step5` | 60 |
+| `motion_anchor_orientation_heading`       | 6  |
+| `motion_anchor_orientation_refheading`    | 6  |
+
+---
+
+### Root Z 位置
+
+| 名称                                     | 维度 |
+| -------------------------------------- | -- |
+| `motion_root_z_position`               | 1  |
+| `motion_root_z_position_10frame_step5` | 10 |
+
+---
+
+## SMPL 观测
+
+来源于 SMPL motion 数据（需要 smpl_pose / smpl_joint 文件）。
+
+---
+
+### SMPL 关节位置
+
+| 名称                                | 维度  |
+| --------------------------------- | --- |
+| `smpl_joints`                     | 72  |
+| `smpl_joints_10frame_step5`       | 720 |
+| `smpl_joints_lower_10frame_step1` | 270 |
+
+---
+
+### SMPL Pose（轴角）
+
+| 名称                        | 维度  |
+| ------------------------- | --- |
+| `smpl_pose`               | 63  |
+| `smpl_pose_10frame_step5` | 630 |
+
+---
+
+### SMPL 别名
+
+| 名称                                      | 维度 |
+| --------------------------------------- | -- |
+| `smpl_root_z_10frame_step1`             | 10 |
+| `smpl_anchor_orientation_10frame_step1` | 60 |
+
+---
+
+## VR 观测
+
+### 3点 VR
+
+| 名称                           | 维度 |
+| ---------------------------- | -- |
+| `vr_3point_local_target`     | 9  |
+| `vr_3point_local_orn_target` | 12 |
+| `vr_3point_compliance`       | 3  |
+
+---
+
+### 5点 VR
+
+| 名称                           | 维度 |
+| ---------------------------- | -- |
+| `vr_5point_local_target`     | 15 |
+| `vr_5point_local_orn_target` | 20 |
+
+---
+
+## 机器人状态历史观测
+
+来自 StateLogger 环形缓冲区。
+
+---
+
+### 当前状态
+
+| 名称                      | 维度 |
+| ----------------------- | -- |
+| `base_angular_velocity` | 3  |
+| `body_joint_positions`  | 29 |
+| `body_joint_velocities` | 29 |
+| `last_actions`          | 29 |
+| `gravity_dir`           | 3  |
+
+---
+
+### 历史帧（4帧）
+
+| 名称                                       | 维度  |
+| ---------------------------------------- | --- |
+| `his_body_joint_positions_4frame_step1`  | 116 |
+| `his_base_angular_velocity_4frame_step1` | 12  |
+
+---
+
+### 历史帧（10帧）
+
+| 名称                                       | 维度  |
+| ---------------------------------------- | --- |
+| `his_body_joint_positions_10frame_step1` | 290 |
+| `his_last_actions_10frame_step1`         | 290 |
+
+---
+
+## 创建自定义观测
+
+---
+
+### Step 1：编写 gather 函数
 
 ```cpp
 bool MyObservation(std::vector<double>& target_buffer, size_t offset) {
-    // Write your observation values into target_buffer starting at offset.
-    // Return true on success, false on failure (will stop the control loop).
-}
-```
-
-**Available data sources inside G1Deploy** (see member variables in `g1_deploy_onnx_ref.cpp` for the full list):
-
-| Source | Description |
-|---|---|
-| `state_logger_` | Ring buffer of past robot states — IMU, joints, velocities, actions, hand states, token state |
-| `current_motion_` / `current_frame_` | Currently-active motion sequence and playback cursor |
-| `operator_state` | Operator control flags (`.play`, `.start`, `.stop`) |
-| `vr_*_buffer_`, `left_hand_joint_buffer_`, etc. | Buffered input interface data — VR tracking, hand joints, compliance, upper-body targets |
-| `heading_state_buffer_`, `movement_state_buffer_` | Thread-safe buffers for heading and planner movement commands |
-
-**Example** — a custom observation that outputs the torso IMU angular velocity (3 values):
-
-```cpp
-bool GatherTorsoAngularVelocity(std::vector<double>& target_buffer, size_t offset) {
-    if (!state_logger_) { return false; }
-
-    auto hist = state_logger_->GetLatest(1);
-    if (hist.empty()) { return false; }
-
-    const auto& entry = hist[0];
-    target_buffer[offset + 0] = entry.body_torso_ang_vel[0];
-    target_buffer[offset + 1] = entry.body_torso_ang_vel[1];
-    target_buffer[offset + 2] = entry.body_torso_ang_vel[2];
+    target_buffer[offset + 0] = ...;
+    target_buffer[offset + 1] = ...;
     return true;
 }
 ```
 
-### Step 2: Register in the Observation Registry
+---
 
-Add your observation to the `GetObservationRegistry()` method in `g1_deploy_onnx_ref.cpp`. Each entry is a tuple of `{name, dimension, gatherer_lambda}`:
+### 可用数据源
 
-```cpp
-std::vector<ObservationRegistry> GetObservationRegistry() {
-    return {
-        // ... existing observations ...
-
-        // Your custom observation:
-        {"torso_angular_velocity", 3,
-         [this](std::vector<double>& buf, size_t offset) {
-             return GatherTorsoAngularVelocity(buf, offset);
-         }},
-    };
-}
-```
-
-The **name** is the string you'll use in the YAML config. The **dimension** must be exact — the system validates that the total of all enabled observations matches the ONNX model input size.
-
-### Step 3: Use in YAML Config
-
-Once registered, your observation is available like any built-in one:
-
-```yaml
-observations:
-  - name: "torso_angular_velocity"
-    enabled: true
-  # ... other observations ...
-```
-
-### Tips
-
-- **Dimension must be fixed.** The observation dimension is set at registration time and cannot change at runtime. If you need variable-size data, pad to a fixed maximum.
-- **Don't allocate in the hot path.** Gatherer functions run at 50 Hz in the control loop. Avoid `new`, `malloc`, or resizing vectors. Pre-allocate buffers in the constructor or use stack arrays.
-- **Return `false` carefully.** Returning `false` from a gatherer stops the entire control loop. Only return `false` for unrecoverable errors. For missing optional data, write zeros and return `true`.
-- **Thread safety.** Gatherers run on the control thread. Reading from `state_logger_` and `DataBuffer` objects is thread-safe. Accessing `current_motion_` and `current_frame_` is protected by `current_motion_mutex_` (already held when `GatherObservations()` is called).
-- **Multi-frame pattern.** If your observation needs temporal windows, follow the existing `GatherHis*` or `GatherMotion*MultiFrame` patterns — they accept `num_frames` and `step_size` parameters and register multiple variants (e.g., `my_obs`, `my_obs_4frame_step1`, `my_obs_10frame_step5`).
-- **Encoder observations.** Custom observations can also be used as encoder inputs. Register them in the same registry — they'll be available for both `observations:` and `encoder_observations:` in the YAML config.
-- **Rebuild after changes.** After modifying the C++ source, rebuild with `just build` from the `gear_sonic_deploy/` directory.
+* `state_logger_`（机器人历史状态）
+* `current_motion_`
+* `operator_state`
+* VR buffer
+* planner buffer
 
 ---
 
-## Example Configurations
+### Step 2：注册观测
 
-### Minimal (154D — default policy)
-
-```yaml
-observations:
-  - name: "motion_joint_positions"       # 29D
-    enabled: true
-  - name: "motion_joint_velocities"      # 29D
-    enabled: true
-  - name: "motion_anchor_orientation"    # 6D
-    enabled: true
-  - name: "base_angular_velocity"        # 3D
-    enabled: true
-  - name: "body_joint_positions"         # 29D
-    enabled: true
-  - name: "body_joint_velocities"        # 29D
-    enabled: true
-  - name: "last_actions"                 # 29D
-    enabled: true
-# Total: 154D
+```cpp
+{"my_obs", 3,
+ [this](std::vector<double>& buf, size_t offset) {
+     return MyObservation(buf, offset);
+ }},
 ```
 
-### Token-Based Policy with Encoder
+---
+
+### Step 3：YAML 使用
 
 ```yaml
 observations:
-  - name: "token_state"                  # 64D (from encoder)
+  - name: "my_obs"
     enabled: true
-  - name: "base_angular_velocity"        # 3D
-    enabled: true
-  - name: "body_joint_positions"         # 29D
-    enabled: true
-  - name: "body_joint_velocities"        # 29D
-    enabled: true
-  - name: "last_actions"                 # 29D
-    enabled: true
+```
+
+---
+
+### 注意事项
+
+* 维度必须固定
+* 不要在循环中动态分配内存
+* 返回 false 会停止控制循环
+* 50Hz 热路径不能做耗时操作
+* 需要重编译：
+
+```bash
+just build
+```
+
+---
+
+## 示例配置
+
+### Minimal（154D）
+
+```yaml
+observations:
+  - name: "motion_joint_positions"
+  - name: "motion_joint_velocities"
+  - name: "motion_anchor_orientation"
+  - name: "base_angular_velocity"
+  - name: "body_joint_positions"
+  - name: "body_joint_velocities"
+  - name: "last_actions"
+```
+
+---
+
+### Token Policy
+
+```yaml
+observations:
+  - name: "token_state"
+  - name: "base_angular_velocity"
+  - name: "body_joint_positions"
+  - name: "body_joint_velocities"
+  - name: "last_actions"
 
 encoder:
   dimension: 64
-  use_fp16: false
   encoder_observations:
-    - name: "motion_joint_positions_10frame_step5"   # 290D
-      enabled: true
-    - name: "motion_joint_velocities_10frame_step5"  # 290D
-      enabled: true
-    - name: "motion_anchor_orientation_10frame_step5" # 60D
-      enabled: true
-    - name: "motion_root_z_position_10frame_step5"   # 10D
-      enabled: true
+    - name: "motion_joint_positions_10frame_step5"
 ```
 
-### VR Teleoperation Policy
+---
+
+### VR Policy
 
 ```yaml
 observations:
-  - name: "token_state"                         # 64D
-    enabled: true
-  - name: "vr_3point_local_target"              # 9D
-    enabled: true
-  - name: "vr_3point_local_orn_target"          # 12D
-    enabled: true
-  - name: "vr_3point_compliance"                # 3D
-    enabled: true
-  - name: "base_angular_velocity"               # 3D
-    enabled: true
-  - name: "body_joint_positions"                # 29D
-    enabled: true
-  - name: "body_joint_velocities"               # 29D
-    enabled: true
-  - name: "last_actions"                        # 29D
-    enabled: true
+  - name: "token_state"
+  - name: "vr_3point_local_target"
+  - name: "vr_3point_local_orn_target"
+  - name: "vr_3point_compliance"
 ```
 
-See [Configuration Format](obs-config-format) above for YAML syntax details.
+---
+
+如果你下一步想要，我可以帮你把这套 observation 系统**画成一张结构图（policy / encoder / motion / VR / robot state 全链路）**，会更直观。

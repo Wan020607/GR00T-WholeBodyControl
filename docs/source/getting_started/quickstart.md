@@ -57,6 +57,21 @@ python gear_sonic/scripts/run_sim_loop.py
 bash deploy.sh sim
 ```
 
+For the HOI carry-box flow, run the same two terminals with `--hoi`:
+
+```sh
+# Terminal 1
+source .venv_sim/bin/activate
+python gear_sonic/scripts/run_sim_loop.py --hoi
+
+# Terminal 2
+cd gear_sonic_deploy
+bash deploy.sh sim --hoi
+```
+
+In `--hoi` mode, the simulator switches to the carry-box MuJoCo scene and the deploy executable enables `residual_policy.onnx` only while the `sonic_export_carrybox` reference motion is actively playing.
+The HOI scene, robot XML, and large-box assets are bundled under `gear_sonic/data/robot_model/model_data/`, so the flow no longer depends on an external `unitree_rl_lab` asset path.
+
 **Starting Control:**
 
 1. In Terminal 2 (deploy.sh), press **`]`** to start the policy.

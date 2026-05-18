@@ -207,6 +207,18 @@ teleop_vids/
 *.code-workspace
 # Motion/training data (large local datasets, not tracked in git)
 data/
+!gear_sonic/data/
+!gear_sonic/data/robot_model/
+!gear_sonic/data/robot_model/model_data/
+!gear_sonic/data/robot_model/model_data/g1/
+!gear_sonic/data/robot_model/model_data/g1/g1_29dof.xml
+!gear_sonic/data/robot_model/model_data/g1/scene_resmimic_carry_box.xml
+!gear_sonic/data/robot_model/model_data/objects/
+!gear_sonic/data/robot_model/model_data/objects/largebox/
+!gear_sonic/data/robot_model/model_data/objects/largebox/urdf/
+!gear_sonic/data/robot_model/model_data/objects/largebox/urdf/largebox.obj
+!gear_sonic/data/robot_model/model_data/objects/largebox/urdf/largebox.xml
+!gear_sonic/data/robot_model/model_data/objects/largebox/urdf/largebox.urdf
 bones_seed_smpl/
 sonic_release/
 # Training output logs

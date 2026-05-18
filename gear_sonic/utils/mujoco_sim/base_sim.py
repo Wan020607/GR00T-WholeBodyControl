@@ -5,6 +5,7 @@ commands, steps physics, and publishes observations back via the SDK bridge.
 BaseSimulator wraps DefaultEnv with rate-limiting and viewer/image update loops.
 """
 
+import csv
 import os
 import pathlib
 from pathlib import Path
@@ -27,6 +28,7 @@ from gear_sonic.utils.mujoco_sim.unitree_sdk2py_bridge import ElasticBand, Unitr
 from gear_sonic.utils.mujoco_sim.robot import Robot
 
 GEAR_SONIC_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+SIM_DEBUG_OUTPUT_DIR = GEAR_SONIC_ROOT / "outputs" / "sim_joint_debug"
 
 
 class DefaultEnv:
@@ -50,6 +52,11 @@ class DefaultEnv:
         self.obs = None
         self.torques = np.zeros(self.num_body_dof + self.num_hand_dof * 2)
         self.torque_limit = np.array(self.robot.MOTOR_EFFORT_LIMIT_LIST)
+        if self.torque_limit.shape[0] != self.torques.shape[0]:
+            raise ValueError(
+                "motor_effort_limit_list length mismatch: "
+                f"expected {self.torques.shape[0]}, got {self.torque_limit.shape[0]}"
+            )
         self.camera_configs = camera_configs
 
         if not camera_configs and offscreen and enable_image_publish:
@@ -60,6 +67,17 @@ class DefaultEnv:
         self.reward_lock = Lock()
         self.unitree_bridge = None
         self.onscreen = onscreen
+        self.hoi_enabled = bool(self.config.get("HOI_ENABLED", False))
+        self.object_pose_topic = self.config.get("OBJECT_POSE_TOPIC", "")
+        self.anchor_pose_topic = self.config.get("ANCHOR_POSE_TOPIC", "")
+        self.object_body_name = self.config.get("OBJECT_BODY_NAME", "")
+        self.anchor_body_name = self.config.get("ANCHOR_BODY_NAME", "")
+        self.pose_debug_print_interval = float(self.config.get("POSE_DEBUG_PRINT_INTERVAL_SEC", 0.0))
+        self._last_pose_debug_time = -1.0
+        self._joint_debug_dump_requested = False
+        self._joint_debug_snapshot_id = 0
+        self._joint_debug_csv_path = None
+        self._joint_debug_header_written = False
 
         self.init_scene()
         self.last_reward = 0
@@ -153,6 +171,21 @@ class DefaultEnv:
         self.torso_index = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, "torso_link")
         self.root_body = "pelvis"
         self.root_body_id = self.mj_model.body(self.root_body).id
+        self.object_body_id = None
+        if self.object_body_name:
+            object_body_id = mujoco.mj_name2id(
+                self.mj_model, mujoco.mjtObj.mjOBJ_BODY, self.object_body_name
+            )
+            if object_body_id >= 0:
+                self.object_body_id = object_body_id
+
+        self.anchor_body_id = None
+        if self.anchor_body_name:
+            anchor_body_id = mujoco.mj_name2id(
+                self.mj_model, mujoco.mjtObj.mjOBJ_BODY, self.anchor_body_name
+            )
+            if anchor_body_id >= 0:
+                self.anchor_body_id = anchor_body_id
 
         self.joint_class_map = self._get_dof_indices_by_class()
 
@@ -198,7 +231,7 @@ class DefaultEnv:
                 self.viewer = mujoco.viewer.launch_passive(
                     self.mj_model,
                     self.mj_data,
-                    key_callback=self.elastic_band.MujuocoKeyCallback,
+                    key_callback=self._viewer_key_callback,
                     show_left_ui=False,
                     show_right_ui=False,
                 )
@@ -208,7 +241,11 @@ class DefaultEnv:
         else:
             if self.onscreen:
                 self.viewer = mujoco.viewer.launch_passive(
-                    self.mj_model, self.mj_data, show_left_ui=False, show_right_ui=False
+                    self.mj_model,
+                    self.mj_data,
+                    key_callback=self._viewer_key_callback,
+                    show_left_ui=False,
+                    show_right_ui=False,
                 )
             else:
                 mujoco.mj_forward(self.mj_model, self.mj_data)
@@ -246,6 +283,7 @@ class DefaultEnv:
         self.body_joint_index = np.array(self.body_joint_index)
         self.left_hand_index = np.array(self.left_hand_index)
         self.right_hand_index = np.array(self.right_hand_index)
+        self.body_joint_names = [self.mj_model.joint(i).name for i in self.body_joint_index]
 
     def init_renderers(self):
         self.renderers = {}
@@ -383,12 +421,25 @@ class DefaultEnv:
             obs["right_hand_dq"] = self.mj_data.qvel[self.right_hand_index + self.qvel_offset - 1]
             obs["right_hand_ddq"] = self.mj_data.qacc[self.right_hand_index + self.qvel_offset - 1]
             obs["right_hand_tau_est"] = self.mj_data.actuator_force[self.right_hand_index - 1]
+        if self.object_body_id is not None:
+            obs["object_pose"] = {
+                "position": self.mj_data.xpos[self.object_body_id].copy(),
+                "quaternion_wxyz": self.mj_data.xquat[self.object_body_id].copy(),
+                "quaternion_xyzw": self.mj_data.xquat[self.object_body_id].copy()[[1, 2, 3, 0]],
+            }
+        if self.anchor_body_id is not None:
+            obs["anchor_pose"] = {
+                "position": self.mj_data.xpos[self.anchor_body_id].copy(),
+                "quaternion_wxyz": self.mj_data.xquat[self.anchor_body_id].copy(),
+                "quaternion_xyzw": self.mj_data.xquat[self.anchor_body_id].copy()[[1, 2, 3, 0]],
+            }
         obs["time"] = self.mj_data.time
         return obs
 
     def sim_step(self):
         self.obs = self.prepare_obs()
         self.unitree_bridge.PublishLowState(self.obs)
+        self._maybe_print_hoi_pose_debug(self.obs)
         if self.unitree_bridge.joystick:
             self.unitree_bridge.PublishWirelessController()
         if self.elastic_band:
@@ -414,6 +465,7 @@ class DefaultEnv:
                 self.mj_data.xfrc_applied[self.band_attached_link] = np.zeros(6)
         body_torques = self.compute_body_torques()
         hand_torques = self.compute_hand_torques()
+        unclipped_body_torques = body_torques.copy()
         # -1: actuator array is 0-based while joint indices from the model are 1-based
         self.torques[self.body_joint_index - 1] = body_torques
         if self.num_hand_dof > 0:
@@ -421,6 +473,13 @@ class DefaultEnv:
             self.torques[self.right_hand_index - 1] = hand_torques[self.num_hand_dof :]
 
         self.torques = np.clip(self.torques, -self.torque_limit, self.torque_limit)
+        clipped_body_torques = self.torques[self.body_joint_index - 1].copy()
+        self._maybe_dump_joint_debug_snapshot(
+            body_q_target=self.compute_body_qpos(),
+            body_q_measured=self.mj_data.qpos[self.body_joint_index + self.qpos_offset - 1].copy(),
+            body_tau_raw=unclipped_body_torques,
+            body_tau_applied=clipped_body_torques,
+        )
 
         if self.config["FREE_BASE"]:
             # Prepend 6 zeros for the floating-base root DOF actuators
@@ -500,6 +559,11 @@ class DefaultEnv:
 
         if key == "backspace":
             self.reset()
+        if key == "2":
+            self._joint_debug_dump_requested = True
+        if key in ["r", "R"]:
+            print("Resetting HOI simulation state.")
+            self.reset()
         if key == "v":
             self.update_viewer_camera()
         if key in ["up", "down", "left", "right"]:
@@ -525,6 +589,138 @@ class DefaultEnv:
 
     def reset(self):
         mujoco.mj_resetData(self.mj_model, self.mj_data)
+        mujoco.mj_forward(self.mj_model, self.mj_data)
+        if self.unitree_bridge is not None:
+            self.unitree_bridge.reset()
+
+    def _viewer_key_callback(self, keycode):
+        if self.elastic_band:
+            self.elastic_band.MujuocoKeyCallback(keycode)
+
+        try:
+            import glfw
+        except ImportError:
+            glfw = None
+
+        key = None
+        if glfw is not None:
+            key_map = {
+                glfw.KEY_BACKSPACE: "backspace",
+                glfw.KEY_V: "v",
+                glfw.KEY_R: "R",
+                glfw.KEY_2: "2",
+                glfw.KEY_UP: "up",
+                glfw.KEY_DOWN: "down",
+                glfw.KEY_LEFT: "left",
+                glfw.KEY_RIGHT: "right",
+            }
+            key = key_map.get(keycode)
+
+        if key is not None:
+            self.handle_keyboard_button(key)
+
+    def _maybe_print_hoi_pose_debug(self, obs: Dict[str, any]):
+        if not self.hoi_enabled:
+            return
+        if "object_pose" not in obs or "anchor_pose" not in obs:
+            return
+        if self.pose_debug_print_interval <= 0:
+            return
+        if self._last_pose_debug_time >= 0 and (
+            obs["time"] - self._last_pose_debug_time < self.pose_debug_print_interval
+        ):
+            return
+
+        object_pos = obs["object_pose"]["position"]
+        anchor_pos = obs["anchor_pose"]["position"]
+        anchor_quat_xyzw = obs["anchor_pose"]["quaternion_xyzw"]
+        relative_pos = Rotation.from_quat(anchor_quat_xyzw).inv().apply(object_pos - anchor_pos)
+
+        print(
+            "[HOI] object_pos="
+            f"{np.round(object_pos, 4).tolist()} "
+            "anchor_pos="
+            f"{np.round(anchor_pos, 4).tolist()} "
+            "object_pos_b="
+            f"{np.round(relative_pos, 4).tolist()}"
+        )
+        self._last_pose_debug_time = obs["time"]
+
+    def _get_joint_debug_csv_path(self) -> Path:
+        if self._joint_debug_csv_path is None:
+            SIM_DEBUG_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            scene_name = Path(self.config["ROBOT_SCENE"]).stem
+            self._joint_debug_csv_path = (
+                SIM_DEBUG_OUTPUT_DIR / f"{scene_name}_joint_debug_{timestamp}.csv"
+            )
+        return self._joint_debug_csv_path
+
+    def _ensure_joint_debug_header(self, csv_path: Path) -> None:
+        if self._joint_debug_header_written:
+            return
+        with csv_path.open("w", newline="") as csv_file:
+            writer = csv.writer(csv_file)
+            writer.writerow(
+                [
+                    "snapshot_id",
+                    "wall_time",
+                    "sim_time",
+                    "joint_index",
+                    "joint_name",
+                    "q_target",
+                    "q_measured",
+                    "tau_raw",
+                    "tau_applied",
+                    "clip_applied",
+                ]
+            )
+        self._joint_debug_header_written = True
+        print(f"[Debug] Joint CSV logging enabled: {csv_path}")
+
+    def _maybe_dump_joint_debug_snapshot(
+        self,
+        body_q_target: np.ndarray,
+        body_q_measured: np.ndarray,
+        body_tau_raw: np.ndarray,
+        body_tau_applied: np.ndarray,
+    ) -> None:
+        if not self._joint_debug_dump_requested:
+            return
+
+        csv_path = self._get_joint_debug_csv_path()
+        self._ensure_joint_debug_header(csv_path)
+
+        snapshot_id = self._joint_debug_snapshot_id
+        wall_time = time.strftime("%Y-%m-%d %H:%M:%S")
+        sim_time = float(self.mj_data.time)
+
+        with csv_path.open("a", newline="") as csv_file:
+            writer = csv.writer(csv_file)
+            for joint_index, joint_name in enumerate(self.body_joint_names):
+                tau_raw = float(body_tau_raw[joint_index])
+                tau_applied = float(body_tau_applied[joint_index])
+                writer.writerow(
+                    [
+                        snapshot_id,
+                        wall_time,
+                        sim_time,
+                        joint_index,
+                        joint_name,
+                        float(body_q_target[joint_index]),
+                        float(body_q_measured[joint_index]),
+                        tau_raw,
+                        tau_applied,
+                        int(not np.isclose(tau_raw, tau_applied)),
+                    ]
+                )
+
+        print(
+            f"[Debug] Wrote joint snapshot {snapshot_id} "
+            f"({len(self.body_joint_names)} joints) to {csv_path}"
+        )
+        self._joint_debug_snapshot_id += 1
+        self._joint_debug_dump_requested = False
 
 
 class BaseSimulator:

@@ -13,10 +13,12 @@ import numpy as np
 import scipy.spatial.transform
 from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber
 from unitree_sdk2py.idl.default import (
+    geometry_msgs_msg_dds__Pose_,
     unitree_go_msg_dds__WirelessController_,
     unitree_hg_msg_dds__HandCmd_ as HandCmd_default,
     unitree_hg_msg_dds__HandState_ as HandState_default,
 )
+from unitree_sdk2py.idl.geometry_msgs.msg.dds_ import Pose_
 from unitree_sdk2py.idl.unitree_go.msg.dds_ import WirelessController_
 from unitree_sdk2py.idl.unitree_hg.msg.dds_ import HandCmd_, HandState_, OdoState_
 
@@ -105,6 +107,21 @@ class UnitreeSdk2Bridge:
             "rt/wirelesscontroller", WirelessController_
         )
         self.wireless_controller_puber.Init()
+
+        self.object_pose_topic = config.get("OBJECT_POSE_TOPIC", "")
+        self.anchor_pose_topic = config.get("ANCHOR_POSE_TOPIC", "")
+        self.object_pose = None
+        self.object_pose_puber = None
+        self.anchor_pose = None
+        self.anchor_pose_puber = None
+        if self.object_pose_topic:
+            self.object_pose = geometry_msgs_msg_dds__Pose_()
+            self.object_pose_puber = ChannelPublisher(self.object_pose_topic, Pose_)
+            self.object_pose_puber.Init()
+        if self.anchor_pose_topic:
+            self.anchor_pose = geometry_msgs_msg_dds__Pose_()
+            self.anchor_pose_puber = ChannelPublisher(self.anchor_pose_topic, Pose_)
+            self.anchor_pose_puber.Init()
 
         # joystick
         self.key_map = {
@@ -217,6 +234,21 @@ class UnitreeSdk2Bridge:
             self.right_hand_state.motor_state[i].q = obs["right_hand_q"][i]
             self.right_hand_state.motor_state[i].dq = obs["right_hand_dq"][i]
         self.right_hand_state_puber.Write(self.right_hand_state)
+
+        if self.object_pose_puber is not None and "object_pose" in obs:
+            self._publish_pose(self.object_pose_puber, self.object_pose, obs["object_pose"])
+        if self.anchor_pose_puber is not None and "anchor_pose" in obs:
+            self._publish_pose(self.anchor_pose_puber, self.anchor_pose, obs["anchor_pose"])
+
+    def _publish_pose(self, publisher, msg, pose: Dict[str, any]):
+        msg.position.x = float(pose["position"][0])
+        msg.position.y = float(pose["position"][1])
+        msg.position.z = float(pose["position"][2])
+        msg.orientation.x = float(pose["quaternion_xyzw"][0])
+        msg.orientation.y = float(pose["quaternion_xyzw"][1])
+        msg.orientation.z = float(pose["quaternion_xyzw"][2])
+        msg.orientation.w = float(pose["quaternion_xyzw"][3])
+        publisher.Write(msg)
 
     def GetAction(self) -> Tuple[np.ndarray, bool, bool]:
         with self.low_cmd_lock:

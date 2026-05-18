@@ -53,7 +53,12 @@ public:
    * @param use_fp16 Whether to use FP16 precision
    * @return true if initialization successful, false otherwise
    */
-  bool Initialize(const std::string& model_path, bool use_fp16 = false) {
+  bool Initialize(
+    const std::string& model_path,
+    bool use_fp16 = false,
+    const std::string& input_tensor_name = "obs_dict",
+    const std::string& output_tensor_name = "action",
+    size_t expected_action_dimension = G1_NUM_MOTOR) {
     if (model_path.empty()) {
       std::cerr << "✗ PolicyEngine::Initialize - Empty model path" << std::endl;
       return false;
@@ -106,16 +111,16 @@ public:
         inference_engine_.reset();
         return false;
       }
-      if (std::find(input_names.begin(), input_names.end(), std::string("obs_dict")) == input_names.end()) {
-        std::cerr << "✗ Policy input tensor 'obs_dict' not found. Available inputs: ";
+      if (std::find(input_names.begin(), input_names.end(), input_tensor_name) == input_names.end()) {
+        std::cerr << "✗ Policy input tensor '" << input_tensor_name << "' not found. Available inputs: ";
         for (const auto& n : input_names) std::cerr << n << ' ';
         std::cerr << std::endl;
         inference_engine_.reset();
         return false;
       }
-      input_tensor_name_ = "obs_dict";
+      input_tensor_name_ = input_tensor_name;
       if (inference_engine_->GetTensorDataType(input_tensor_name_) != DataType::FLOAT) {
-        std::cerr << "✗ Policy input 'obs_dict' must be float32" << std::endl;
+        std::cerr << "✗ Policy input '" << input_tensor_name_ << "' must be float32" << std::endl;
         inference_engine_.reset();
         return false;
       }
@@ -146,14 +151,14 @@ public:
         inference_engine_.reset();
         return false;
       }
-      if (std::find(output_names.begin(), output_names.end(), std::string("action")) == output_names.end()) {
-        std::cerr << "✗ Policy output tensor 'action' not found. Available outputs: ";
+      if (std::find(output_names.begin(), output_names.end(), output_tensor_name) == output_names.end()) {
+        std::cerr << "✗ Policy output tensor '" << output_tensor_name << "' not found. Available outputs: ";
         for (const auto& n : output_names) std::cerr << n << ' ';
         std::cerr << std::endl;
         inference_engine_.reset();
         return false;
       }
-      output_tensor_name_ = "action";
+      output_tensor_name_ = output_tensor_name;
 
       // Get output dimensions
       std::vector<int64_t> output_dims;
@@ -164,9 +169,9 @@ public:
       }
 
       // Validate action dimension matches robot configuration
-      if (config_.action_dimension != G1_NUM_MOTOR) {
+      if (config_.action_dimension != expected_action_dimension) {
         std::cerr << "✗ Policy action dimension (" << config_.action_dimension 
-                  << ") doesn't match G1 robot motors (" << G1_NUM_MOTOR << ")" << std::endl;
+                  << ") doesn't match expected dimension (" << expected_action_dimension << ")" << std::endl;
         inference_engine_.reset();
         return false;
       }
@@ -440,4 +445,3 @@ private:
 };
 
 #endif // POLICY_ENGINE_HPP
-

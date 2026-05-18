@@ -211,6 +211,8 @@ show_usage() {
     echo "  --input-type TYPE       Set the input type (default: zmq_manager)"
     echo "  --output-type TYPE      Set the output type (default: ros2)"
     echo "  --zmq-host HOST         Set the ZMQ host (default: localhost)"
+    echo "  --hoi                   Enable HOI carry-box residual policy in simulation"
+    echo "  --residual-model PATH   Set the HOI residual policy path (default: policy/release/residual_policy.onnx)"
     echo ""
     echo "Interface modes:"
     echo "  sim              Use loopback interface for simulation (MuJoCo)"
@@ -242,6 +244,8 @@ MOTION_DATA_DEFAULT="reference/example/"
 INPUT_TYPE_DEFAULT="manager"
 OUTPUT_TYPE_DEFAULT="all"
 ZMQ_HOST_DEFAULT="localhost"
+RESIDUAL_MODEL_DEFAULT="policy/release/residual_policy.onnx"
+HOI_ENABLED=false
 
 # Initialize with defaults (will be set after parsing)
 CHECKPOINT="$CHECKPOINT_DEFAULT"
@@ -251,6 +255,7 @@ MOTION_DATA="$MOTION_DATA_DEFAULT"
 INPUT_TYPE="$INPUT_TYPE_DEFAULT"
 OUTPUT_TYPE="$OUTPUT_TYPE_DEFAULT"
 ZMQ_HOST="$ZMQ_HOST_DEFAULT"
+RESIDUAL_MODEL="$RESIDUAL_MODEL_DEFAULT"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -313,6 +318,18 @@ while [[ $# -gt 0 ]]; do
                 exit 1
             fi
             ZMQ_HOST="$2"
+            shift 2
+            ;;
+        --hoi)
+            HOI_ENABLED=true
+            shift
+            ;;
+        --residual-model)
+            if [[ -z "$2" ]]; then
+                echo -e "${RED}Error: --residual-model requires a path argument${NC}" >&2
+                exit 1
+            fi
+            RESIDUAL_MODEL="$2"
             shift 2
             ;;
         sim|real)
@@ -387,6 +404,11 @@ if [[ "$ENV_TYPE" == "sim" ]]; then
     echo ""
 fi
 
+if [[ "$HOI_ENABLED" == true && "$ENV_TYPE" != "sim" ]]; then
+    echo -e "${RED}❌ --hoi only supports simulation mode.${NC}"
+    exit 1
+fi
+
 # ============================================================================
 # Step 1: Check Prerequisites
 # ============================================================================
@@ -427,6 +449,9 @@ check_file "$CHECKPOINT_DECODER" || MISSING_FILES=$((MISSING_FILES + 1))
 check_file "$CHECKPOINT_ENCODER" || MISSING_FILES=$((MISSING_FILES + 1))
 check_file "$OBS_CONFIG" || MISSING_FILES=$((MISSING_FILES + 1))
 check_file "$PLANNER" || MISSING_FILES=$((MISSING_FILES + 1))
+if [[ "$HOI_ENABLED" == true ]]; then
+    check_file "$RESIDUAL_MODEL" || MISSING_FILES=$((MISSING_FILES + 1))
+fi
 
 if [ -d "$MOTION_DATA" ]; then
     echo -e "${GREEN}✅ Found: $MOTION_DATA${NC}"
@@ -515,6 +540,10 @@ echo -e "  Planner:            ${GREEN}$PLANNER${NC}"
 echo -e "  Input Type:         ${GREEN}$INPUT_TYPE${NC}"
 echo -e "  Output Type:        ${GREEN}$OUTPUT_TYPE${NC}"
 echo -e "  ZMQ Host:           ${GREEN}$ZMQ_HOST${NC}"
+echo -e "  HOI Mode:           ${GREEN}$HOI_ENABLED${NC}"
+if [[ "$HOI_ENABLED" == true ]]; then
+echo -e "  Residual Model:     ${GREEN}$RESIDUAL_MODEL${NC}"
+fi
 if [[ -n "$EXTRA_ARGS" ]]; then
 echo -e "  Extra Args:         ${GREEN}$EXTRA_ARGS${NC}"
 fi
@@ -530,6 +559,9 @@ echo -e "${BLUE}    --planner-file $PLANNER \\${NC}"
 echo -e "${BLUE}    --input-type $INPUT_TYPE \\${NC}"
 echo -e "${BLUE}    --output-type $OUTPUT_TYPE \\${NC}"
 echo -e "${BLUE}    --zmq-host $ZMQ_HOST${NC}"
+if [[ "$HOI_ENABLED" == true ]]; then
+echo -e "${BLUE}    --hoi --residual-model $RESIDUAL_MODEL${NC}"
+fi
 if [[ -n "$EXTRA_ARGS" ]]; then
 echo -e "${BLUE}    $EXTRA_ARGS${NC}"
 fi
@@ -553,22 +585,47 @@ if [[ "$confirm" =~ ^[Yy]$ ]] || [[ -z "$confirm" ]]; then
     
     # Build the command with optional extra args
     if [[ -n "$EXTRA_ARGS" ]]; then
-        just run g1_deploy_onnx_ref "$TARGET" "$CHECKPOINT_DECODER" "$MOTION_DATA" \
-            --obs-config "$OBS_CONFIG" \
-            --encoder-file "$CHECKPOINT_ENCODER" \
-            --planner-file "$PLANNER" \
-            --input-type "$INPUT_TYPE" \
-            --output-type "$OUTPUT_TYPE" \
-            --zmq-host "$ZMQ_HOST" \
-            $EXTRA_ARGS
+        if [[ "$HOI_ENABLED" == true ]]; then
+            just run g1_deploy_onnx_ref "$TARGET" "$CHECKPOINT_DECODER" "$MOTION_DATA" \
+                --obs-config "$OBS_CONFIG" \
+                --encoder-file "$CHECKPOINT_ENCODER" \
+                --planner-file "$PLANNER" \
+                --input-type "$INPUT_TYPE" \
+                --output-type "$OUTPUT_TYPE" \
+                --zmq-host "$ZMQ_HOST" \
+                --hoi \
+                --residual-model "$RESIDUAL_MODEL" \
+                $EXTRA_ARGS
+        else
+            just run g1_deploy_onnx_ref "$TARGET" "$CHECKPOINT_DECODER" "$MOTION_DATA" \
+                --obs-config "$OBS_CONFIG" \
+                --encoder-file "$CHECKPOINT_ENCODER" \
+                --planner-file "$PLANNER" \
+                --input-type "$INPUT_TYPE" \
+                --output-type "$OUTPUT_TYPE" \
+                --zmq-host "$ZMQ_HOST" \
+                $EXTRA_ARGS
+        fi
     else
-        just run g1_deploy_onnx_ref "$TARGET" "$CHECKPOINT_DECODER" "$MOTION_DATA" \
-            --obs-config "$OBS_CONFIG" \
-            --encoder-file "$CHECKPOINT_ENCODER" \
-            --planner-file "$PLANNER" \
-            --input-type "$INPUT_TYPE" \
-            --output-type "$OUTPUT_TYPE" \
-            --zmq-host "$ZMQ_HOST"
+        if [[ "$HOI_ENABLED" == true ]]; then
+            just run g1_deploy_onnx_ref "$TARGET" "$CHECKPOINT_DECODER" "$MOTION_DATA" \
+                --obs-config "$OBS_CONFIG" \
+                --encoder-file "$CHECKPOINT_ENCODER" \
+                --planner-file "$PLANNER" \
+                --input-type "$INPUT_TYPE" \
+                --output-type "$OUTPUT_TYPE" \
+                --zmq-host "$ZMQ_HOST" \
+                --hoi \
+                --residual-model "$RESIDUAL_MODEL"
+        else
+            just run g1_deploy_onnx_ref "$TARGET" "$CHECKPOINT_DECODER" "$MOTION_DATA" \
+                --obs-config "$OBS_CONFIG" \
+                --encoder-file "$CHECKPOINT_ENCODER" \
+                --planner-file "$PLANNER" \
+                --input-type "$INPUT_TYPE" \
+                --output-type "$OUTPUT_TYPE" \
+                --zmq-host "$ZMQ_HOST"
+        fi
     fi
 else
     echo ""

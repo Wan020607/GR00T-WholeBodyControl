@@ -117,6 +117,7 @@ just run g1_deploy_onnx_ref lo policy/release/model_decoder.onnx reference/examp
   - `--target-motion-logfile <path>`: Log the target motion tracked by the controller (visualize with `visualize_motion.py`)
   - `--planner-motion-logfile <path>`: Log planner-generated animation sequences
   - `--policy-input-logfile <path>`: Log policy input (observation) tensors
+  - `--encoder-input-logfile <path>`: Log encoder input tensors before encoder inference
   - `--record-input-file <path>`: Record operator control inputs to CSV for later playback
   - `--playback-input-file <path>`: Play back previously recorded control inputs from CSV
 - **State CSV logs (write a timestamped directory)**:
@@ -185,8 +186,13 @@ This displays four G1 robots: target animation (colored), target with zero trans
 
 **Policy Input (`--policy-input-logfile <path>`):**
 - Logs the raw observation tensor fed to the neural network policy
-- Output: a single CSV file (one row per control step, all observation values)
+- Output: a single CSV file with a header row, then one row per control step
 - Useful for debugging observation configuration and input drift
+
+**Encoder Input (`--encoder-input-logfile <path>`):**
+- Logs the raw observation tensor fed to the encoder before encoder inference
+- Output: a single CSV file with a header row, then one row per control step
+- Only written when an encoder is loaded via `--encoder-file`
 
 ### Control Input Recording/Playback
 

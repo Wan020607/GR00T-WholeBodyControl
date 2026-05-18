@@ -74,6 +74,7 @@
 #include <unitree/idl/hg/IMUState_.hpp>
 #include <unitree/idl/hg/LowCmd_.hpp>
 #include <unitree/idl/hg/LowState_.hpp>
+#include <unitree/idl/ros2/Pose_.hpp>
 #include <unitree/robot/b2/motion_switcher/motion_switcher_client.hpp>
 
 // TRTInference
@@ -142,6 +143,7 @@
 using namespace unitree::common;
 using namespace unitree::robot;
 using namespace unitree_hg::msg::dds_;
+using Pose_ = geometry_msgs::msg::dds_::Pose_;
 
 
 
@@ -265,12 +267,16 @@ class G1Deploy {
     DataBuffer<LowState_> low_state_buffer_;
     DataBuffer<MotorCommand> motor_command_buffer_;
     DataBuffer<IMUState_> imu_torso_buffer_;
+    DataBuffer<Pose_> object_pose_buffer_;
+    DataBuffer<Pose_> anchor_pose_buffer_;
     DataBuffer<HeadingState> heading_state_buffer_;
     DataBuffer<MovementState> movement_state_buffer_;
     
     ChannelPublisherPtr<LowCmd_> lowcmd_publisher_;
     ChannelSubscriberPtr<LowState_> lowstate_subscriber_;
     ChannelSubscriberPtr<IMUState_> imutorso_subscriber_;
+    ChannelSubscriberPtr<Pose_> object_pose_subscriber_;
+    ChannelSubscriberPtr<Pose_> anchor_pose_subscriber_;
     ThreadPtr input_thread_ptr_, command_writer_ptr_, control_thread_ptr_, planner_thread_ptr_;
     
     // =========================================================================
@@ -294,8 +300,10 @@ class G1Deploy {
     // =========================================================================
     static constexpr std::chrono::milliseconds LOW_STATE_LATE_THRESHOLD{50};
     static constexpr std::chrono::milliseconds LOW_STATE_ABSENT_THRESHOLD{500};
+    static constexpr std::chrono::milliseconds HOI_POSE_ABSENT_THRESHOLD{200};
     ProgramState program_state_;
     std::array<double, G1_NUM_MOTOR> last_action;
+    std::array<double, G1_NUM_MOTOR> last_residual_action_;
     std::array<double, 7> last_left_hand_action;
     std::array<double, 7> last_right_hand_action;
     
@@ -305,6 +313,7 @@ class G1Deploy {
     std::unique_ptr<std::ofstream> target_motion_file_;
     std::unique_ptr<std::ofstream> planner_motion_file_;
     std::unique_ptr<std::ofstream> policy_input_file_;
+    std::unique_ptr<std::ofstream> encoder_input_file_;
     std::unique_ptr<std::ofstream> record_input_file_;
     std::unique_ptr<std::ifstream> playback_input_file_;
 
@@ -357,6 +366,15 @@ class G1Deploy {
     
     // Control policy
     std::unique_ptr<PolicyEngine> policy_engine_;
+    std::unique_ptr<PolicyEngine> residual_policy_engine_;
+    std::vector<double> residual_obs_buffer_;
+    bool hoi_enabled_ = false;
+    bool residual_warning_printed_ = false;
+    std::string residual_model_path_;
+
+    static constexpr const char* HOI_OBJECT_POSE_TOPIC = "rt/resmimic/object_pose";
+    static constexpr const char* HOI_ANCHOR_POSE_TOPIC = "rt/resmimic/anchor_pose";
+    static constexpr const char* HOI_CARRYBOX_MOTION_NAME = "sonic_export_carrybox";
     
     // =========================================================================
     // Observation system configuration and runtime state
@@ -1435,6 +1453,121 @@ class G1Deploy {
       return true;
     }
 
+    bool GatherCurrentBaseAngularVelocity(std::vector<double>& target_buffer, size_t offset) {
+      if (!state_logger_) { return false; }
+      auto hist = state_logger_->GetLatest(1, control_dt_);
+      if (hist.empty()) { return false; }
+      target_buffer[offset + 0] = hist[0].base_ang_vel[0];
+      target_buffer[offset + 1] = hist[0].base_ang_vel[1];
+      target_buffer[offset + 2] = hist[0].base_ang_vel[2];
+      return true;
+    }
+
+    bool GatherCurrentBodyJointPositions(std::vector<double>& target_buffer, size_t offset) {
+      if (!state_logger_) { return false; }
+      auto hist = state_logger_->GetLatest(1, control_dt_);
+      if (hist.empty() || hist[0].body_q.empty()) { return false; }
+      std::copy(hist[0].body_q.begin(), hist[0].body_q.begin() + G1_NUM_MOTOR, target_buffer.begin() + offset);
+      return true;
+    }
+
+    bool GatherCurrentBodyJointVelocities(std::vector<double>& target_buffer, size_t offset) {
+      if (!state_logger_) { return false; }
+      auto hist = state_logger_->GetLatest(1, control_dt_);
+      if (hist.empty() || hist[0].body_dq.empty()) { return false; }
+      std::copy(hist[0].body_dq.begin(), hist[0].body_dq.begin() + G1_NUM_MOTOR, target_buffer.begin() + offset);
+      return true;
+    }
+
+    bool GatherResidualObjectPosition(std::vector<double>& target_buffer, size_t offset) {
+      auto object_pose_data = object_pose_buffer_.GetDataWithTime();
+      auto anchor_pose_data = anchor_pose_buffer_.GetDataWithTime();
+      if (!object_pose_data.data || !anchor_pose_data.data) { return false; }
+
+      const auto now = std::chrono::steady_clock::now();
+      if ((now - object_pose_data.timestamp) > HOI_POSE_ABSENT_THRESHOLD ||
+          (now - anchor_pose_data.timestamp) > HOI_POSE_ABSENT_THRESHOLD) {
+        return false;
+      }
+
+      const auto object_pos = PoseToPosition(*object_pose_data.data);
+      const auto anchor_pos = PoseToPosition(*anchor_pose_data.data);
+      const auto anchor_quat = PoseToQuatWxyz(*anchor_pose_data.data);
+      const auto anchor_quat_inv = quat_conjugate_d(anchor_quat);
+      const std::array<double, 3> world_delta = {
+        object_pos[0] - anchor_pos[0],
+        object_pos[1] - anchor_pos[1],
+        object_pos[2] - anchor_pos[2],
+      };
+      const auto object_pos_b = quat_rotate_d(anchor_quat_inv, world_delta);
+
+      target_buffer[offset + 0] = object_pos_b[0];
+      target_buffer[offset + 1] = object_pos_b[1];
+      target_buffer[offset + 2] = object_pos_b[2];
+      return true;
+    }
+
+    bool GatherResidualObjectOrientation(std::vector<double>& target_buffer, size_t offset) {
+      auto object_pose_data = object_pose_buffer_.GetDataWithTime();
+      auto anchor_pose_data = anchor_pose_buffer_.GetDataWithTime();
+      if (!object_pose_data.data || !anchor_pose_data.data) { return false; }
+
+      const auto now = std::chrono::steady_clock::now();
+      if ((now - object_pose_data.timestamp) > HOI_POSE_ABSENT_THRESHOLD ||
+          (now - anchor_pose_data.timestamp) > HOI_POSE_ABSENT_THRESHOLD) {
+        return false;
+      }
+
+      const auto object_quat = PoseToQuatWxyz(*object_pose_data.data);
+      const auto anchor_quat = PoseToQuatWxyz(*anchor_pose_data.data);
+      const auto object_quat_b = quat_mul_d(quat_conjugate_d(anchor_quat), object_quat);
+      const auto object_rot_b = quat_to_rotation_matrix_d(object_quat_b);
+
+      target_buffer[offset + 0] = object_rot_b[0][0];
+      target_buffer[offset + 1] = object_rot_b[0][1];
+      target_buffer[offset + 2] = object_rot_b[1][0];
+      target_buffer[offset + 3] = object_rot_b[1][1];
+      target_buffer[offset + 4] = object_rot_b[2][0];
+      target_buffer[offset + 5] = object_rot_b[2][1];
+      return true;
+    }
+
+    bool ShouldUseResidualPolicy(
+      const std::shared_ptr<const MotionSequence>& current_motion_copy,
+      bool current_play_copy) const {
+      return hoi_enabled_ &&
+             residual_policy_engine_ &&
+             residual_policy_engine_->IsInitialized() &&
+             current_motion_copy &&
+             current_play_copy &&
+             current_motion_copy->name == HOI_CARRYBOX_MOTION_NAME;
+    }
+
+    bool GatherResidualObservations() {
+      if (residual_obs_buffer_.size() != 163) {
+        residual_obs_buffer_.assign(163, 0.0);
+      } else {
+        std::fill(residual_obs_buffer_.begin(), residual_obs_buffer_.end(), 0.0);
+      }
+
+      if (!GatherMotionJointPositionsMultiFrame(residual_obs_buffer_, 0, 1, 1)) { return false; }
+      if (!GatherMotionJointVelocitiesMultiFrame(residual_obs_buffer_, 29, 1, 1)) { return false; }
+      if (!GatherMotionAnchorOrientationMutiFrame(residual_obs_buffer_, 58, 1, 1)) { return false; }
+      if (!GatherCurrentBaseAngularVelocity(residual_obs_buffer_, 64)) { return false; }
+      if (!GatherCurrentBodyJointPositions(residual_obs_buffer_, 67)) { return false; }
+      if (!GatherCurrentBodyJointVelocities(residual_obs_buffer_, 96)) { return false; }
+
+      std::copy(
+        last_residual_action_.begin(),
+        last_residual_action_.end(),
+        residual_obs_buffer_.begin() + 125
+      );
+
+      if (!GatherResidualObjectPosition(residual_obs_buffer_, 154)) { return false; }
+      if (!GatherResidualObjectOrientation(residual_obs_buffer_, 157)) { return false; }
+      return true;
+    }
+
     // =========================================================================
     // History-based observation gatherers (from StateLogger)
     //
@@ -1974,6 +2107,25 @@ class G1Deploy {
       
       std::cout << "================================\n" << std::endl;
     }
+
+    void WriteObservationHeader(std::ofstream& file, const std::vector<ActiveObservation>& observations) {
+      bool first = true;
+      for (const auto& obs : observations) {
+        if (obs.dimension == 1) {
+          if (!first) { file << ","; }
+          file << obs.name;
+          first = false;
+          continue;
+        }
+
+        for (size_t i = 0; i < obs.dimension; ++i) {
+          if (!first) { file << ","; }
+          file << obs.name << "_" << i;
+          first = false;
+        }
+      }
+      file << std::endl;
+    }
     
     // Gather observations (simplified - functions read from internal state)
     bool GatherObservations() {
@@ -2139,6 +2291,7 @@ class G1Deploy {
       std::string target_motion_file_path = "",
       std::string planner_motion_file_path = "",
       std::string policy_input_file_path = "",
+      std::string encoder_input_file_path = "",
       std::string input_type = "keyboard",
       std::string output_type = "zmq",
       std::string record_input_file_path = "",
@@ -2156,7 +2309,9 @@ class G1Deploy {
       std::string zmq_out_topic = "g1_debug",
       bool enable_motion_recording = false,
       std::array<double, 3> initial_compliance = {0.05, 0.05, 0.0},
-      double initial_max_close_ratio = 1.0)
+      double initial_max_close_ratio = 1.0,
+      bool hoi_enabled = false,
+      std::string residual_policy_file_path = "")
       : time_(0.0),
         publish_dt_(0.002),
         control_dt_(0.02),
@@ -2169,14 +2324,17 @@ class G1Deploy {
         disable_crc_check_(disable_crc_check),
         program_state_(ProgramState::INIT),
         last_action {0.0},
+        last_residual_action_ {0.0},
         last_left_hand_action {0.0},
         last_right_hand_action {0.0},
         enable_motion_recording_(enable_motion_recording),
         initial_vr_3point_compliance_(initial_compliance),
         initial_max_close_ratio_(initial_max_close_ratio),
+        hoi_enabled_(hoi_enabled),
         //env(ORT_LOGGING_LEVEL_WARNING, "G1Deploy"),
         model_path(model_file_path),
-        planner_path(planner_file_path) {
+        planner_path(planner_file_path),
+        residual_model_path_(residual_policy_file_path) {
       
       // Initialize ChannelFactory
       ChannelFactory::Instance()->Init(0, networkInterface);
@@ -2214,6 +2372,16 @@ class G1Deploy {
 
         // open file in append mode:
         policy_input_file_ = std::make_unique<std::ofstream>(policy_input_file_path, std::ios::app);
+      }
+
+      if(!encoder_input_file_path.empty())
+      {
+        // clear existing file:
+        std::ofstream f(encoder_input_file_path);
+        f.close();
+
+        // open file in append mode:
+        encoder_input_file_ = std::make_unique<std::ofstream>(encoder_input_file_path, std::ios::app);
       }
 
       if(!record_input_file_path.empty())
@@ -2259,6 +2427,15 @@ class G1Deploy {
       lowstate_subscriber_->InitChannel(std::bind(&G1Deploy::LowStateHandler, this, std::placeholders::_1), 1);
       imutorso_subscriber_.reset(new ChannelSubscriber<IMUState_>(HG_IMU_TORSO));
       imutorso_subscriber_->InitChannel(std::bind(&G1Deploy::imuTorsoHandler, this, std::placeholders::_1), 1);
+
+      if (hoi_enabled_) {
+        object_pose_subscriber_.reset(new ChannelSubscriber<Pose_>(HOI_OBJECT_POSE_TOPIC));
+        object_pose_subscriber_->InitChannel(std::bind(&G1Deploy::ObjectPoseHandler, this, std::placeholders::_1), 1);
+        anchor_pose_subscriber_.reset(new ChannelSubscriber<Pose_>(HOI_ANCHOR_POSE_TOPIC));
+        anchor_pose_subscriber_->InitChannel(std::bind(&G1Deploy::AnchorPoseHandler, this, std::placeholders::_1), 1);
+        std::cout << "[HOI] Subscribed pose topics: " << HOI_OBJECT_POSE_TOPIC
+                  << " , " << HOI_ANCHOR_POSE_TOPIC << std::endl;
+      }
       // Load motion data
       if (motion_reader_.ReadFromCSV(motion_data_path)) {
         if (!motion_reader_.motions.empty()) {
@@ -2307,6 +2484,26 @@ class G1Deploy {
       }
       
       std::cout << "✓ Policy model loaded successfully!" << std::endl;
+
+      if (hoi_enabled_) {
+        if (residual_model_path_.empty()) {
+          throw std::runtime_error("HOI mode requires a residual policy model path");
+        }
+        residual_policy_engine_ = std::make_unique<PolicyEngine>();
+        if (!residual_policy_engine_->Initialize(
+              residual_model_path_,
+              policy_fp16,
+              "obs",
+              "actions",
+              G1_NUM_MOTOR)) {
+          throw std::runtime_error("Failed to initialize residual policy from: " + residual_model_path_);
+        }
+        if (!residual_policy_engine_->CaptureGraph()) {
+          throw std::runtime_error("Failed to capture residual policy CUDA graph");
+        }
+        residual_obs_buffer_.resize(residual_policy_engine_->GetInputDimension(), 0.0);
+        std::cout << "✓ HOI residual policy loaded successfully!" << std::endl;
+      }
 
       // Load observation configuration FIRST (before encoder/planner initialization)
       std::cout << "Loading observation configuration..." << std::endl;
@@ -2415,6 +2612,13 @@ class G1Deploy {
       
       // Initialize observation function map
       InitializeObservationFunctions();
+
+      if (policy_input_file_) {
+        WriteObservationHeader(*policy_input_file_, active_obs_functions_);
+      }
+      if (encoder_input_file_ && !active_encoder_obs_functions_.empty()) {
+        WriteObservationHeader(*encoder_input_file_, active_encoder_obs_functions_);
+      }
       
       // Log observation configuration details
       LogObservationConfiguration();
@@ -2426,6 +2630,8 @@ class G1Deploy {
       robot_config["planner_path"] = planner_path.empty() ? "none" : planner_path;
       robot_config["obs_config_path"] = obs_config_path.empty() ? "none" : obs_config_path;
       robot_config["encoder_file"] = encoder_file_path.empty() ? "none" : encoder_file_path;
+      robot_config["hoi_enabled"] = hoi_enabled_;
+      robot_config["residual_policy_file"] = residual_model_path_.empty() ? "none" : residual_model_path_;
       robot_config["control_frequency"] = 1.0 / control_dt_;
       robot_config["planner_frequency"] = 1.0 / planner_dt_;
       robot_config["is_using_encoder"] = is_using_encoder_;
@@ -2646,6 +2852,33 @@ class G1Deploy {
     void imuTorsoHandler(const void* message) {
       IMUState_ imu_torso = *(const IMUState_*)message;
       imu_torso_buffer_.SetData(imu_torso);
+    }
+
+    void ObjectPoseHandler(const void* message) {
+      Pose_ object_pose = *(const Pose_*)message;
+      object_pose_buffer_.SetData(object_pose);
+    }
+
+    void AnchorPoseHandler(const void* message) {
+      Pose_ anchor_pose = *(const Pose_*)message;
+      anchor_pose_buffer_.SetData(anchor_pose);
+    }
+
+    static std::array<double, 3> PoseToPosition(const Pose_& pose) {
+      return {
+        static_cast<double>(pose.position().x()),
+        static_cast<double>(pose.position().y()),
+        static_cast<double>(pose.position().z()),
+      };
+    }
+
+    static std::array<double, 4> PoseToQuatWxyz(const Pose_& pose) {
+      return {
+        static_cast<double>(pose.orientation().w()),
+        static_cast<double>(pose.orientation().x()),
+        static_cast<double>(pose.orientation().y()),
+        static_cast<double>(pose.orientation().z()),
+      };
     }
 
     /**
@@ -3098,7 +3331,7 @@ class G1Deploy {
      * then maps the action output (IsaacLab order) to a MotorCommand
      * (hardware order) using `g1_action_scale` and `default_angles`.
      */
-    bool CreatePolicyCommand() {
+    bool CreatePolicyCommand(bool use_residual_policy) {
       // Convert double observation to float and populate policy's internal input buffer
       auto& obs_buffer_float = policy_engine_->GetInputBuffer();
       for (size_t i = 0; i < obs_buffer_.size(); i++) { 
@@ -3114,10 +3347,33 @@ class G1Deploy {
       // Access actions from control policy's internal buffer (already populated by Infer)
       auto& action_buffer = policy_engine_->GetActionBuffer();
       float* floatarr = action_buffer.data();
+
+      std::array<double, G1_NUM_MOTOR> residual_action{};
+      if (use_residual_policy) {
+        auto& residual_input_buffer = residual_policy_engine_->GetInputBuffer();
+        for (size_t i = 0; i < residual_obs_buffer_.size(); ++i) {
+          residual_input_buffer[i] = static_cast<float>(residual_obs_buffer_[i]);
+        }
+        if (!residual_policy_engine_->Infer()) {
+          std::cerr << "✗ Error: Residual policy inference failed" << std::endl;
+          return false;
+        }
+
+        auto& residual_output_buffer = residual_policy_engine_->GetActionBuffer();
+        for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+          residual_action[i] = static_cast<double>(residual_output_buffer[i]);
+          last_residual_action_[i] = residual_action[i];
+        }
+      } else {
+        last_residual_action_.fill(0.0);
+      }
       
       MotorCommand motor_command_tmp;
       for (int i = 0; i < G1_NUM_MOTOR; i++) {
-        const double action_value = static_cast<double>(floatarr[isaaclab_to_mujoco[i]]) * g1_action_scale[i];
+        const int isaaclab_index = isaaclab_to_mujoco[i];
+        const double combined_action =
+          static_cast<double>(floatarr[isaaclab_index]) + residual_action[isaaclab_index];
+        const double action_value = combined_action * g1_action_scale[i];
         last_action[i] = static_cast<double>(floatarr[i]);
         motor_command_tmp.q_target.at(i) = static_cast<float>(default_angles[i] + action_value);
         motor_command_tmp.tau_ff.at(i) = 0.0;
@@ -3903,6 +4159,7 @@ class G1Deploy {
           int current_frame_copy;
           int current_encoder_mode_copy;
           bool current_play_copy;
+          bool use_residual_policy = false;
           std::shared_ptr<const MotionSequence> current_motion_copy = nullptr;
           {
             std::lock_guard<std::mutex> lock(current_motion_mutex_);
@@ -3926,6 +4183,18 @@ class G1Deploy {
               operator_state.stop = true;
               return;
             }
+
+            if (ShouldUseResidualPolicy(current_motion_copy, current_play_copy)) {
+              use_residual_policy = GatherResidualObservations();
+              if (use_residual_policy) {
+                residual_warning_printed_ = false;
+              } else if (!residual_warning_printed_) {
+                std::cerr << "⚠ Warning: HOI residual observations are not ready yet, base policy only." << std::endl;
+                residual_warning_printed_ = true;
+              }
+            } else {
+              residual_warning_printed_ = false;
+            }
           } // Release lock after all observation-dependent operations
 
           // Log post-state data (token state) to the most recent state logger entry
@@ -3939,7 +4208,7 @@ class G1Deploy {
 
           auto obs_end_time = std::chrono::steady_clock::now();
 
-          if (!CreatePolicyCommand()) {
+          if (!CreatePolicyCommand(use_residual_policy)) {
             std::cout << "✗ Error: Failed to create policy command in the middle of the control loop!" << std::endl;
             std::cout << "Stopping control system." << std::endl;
             operator_state.stop = true;
@@ -4029,6 +4298,15 @@ class G1Deploy {
             (*policy_input_file_) << std::endl;
           }
 
+          if (encoder_input_file_ && is_using_encoder_)
+          {
+            for (auto d : encoder_obs_buffer_)
+            {
+              (*encoder_input_file_) << d << ",";
+            }
+            (*encoder_input_file_) << std::endl;
+          }
+
           if (!CurrentFrameAdvancement()) {
             std::cout << "✗ Error: Failed to advance current frame in the middle of the control loop!" << std::endl;
             std::cout << "Stopping control system." << std::endl;
@@ -4113,6 +4391,7 @@ int main(int argc, char const* argv[]) {
     std::cout << "  --target-motion-logfile <path>: write target motion to a csv file if provided" << std::endl;
     std::cout << "  --planner-motion-logfile <path>: write planner motion to a csv file if provided" << std::endl;
     std::cout << "  --policy-input-logfile <path>: write policy input tensors to a csv file if provided" << std::endl;
+    std::cout << "  --encoder-input-logfile <path>: write encoder input tensors to a csv file if provided" << std::endl;
     std::cout << "  --disable-crc-check: disable CRC validation for MuJoCo simulation" << std::endl;
     std::cout << "  --obs-config <path>: specify observation configuration YAML file" << std::endl;
     std::cout << "  --encoder-file <path>: specify encoder ONNX file (optional)" << std::endl;
@@ -4134,6 +4413,8 @@ int main(int argc, char const* argv[]) {
     std::cout << "  --max-close-ratio <value>: set initial hand max close ratio (0.2-1.0; default: 1.0 = full closure)" << std::endl;
     std::cout << "                             0.2 = limited (80% open), 1.0 = full closure allowed" << std::endl;
     std::cout << "                             Keyboard controls: x/c = +/- 0.1 (always available)" << std::endl;
+    std::cout << "  --hoi: enable HOI carry-box residual policy in simulation" << std::endl;
+    std::cout << "  --residual-model <path>: specify HOI residual policy ONNX file" << std::endl;
     std::cout << "\nExamples:" << std::endl;
     std::cout << "  " << argv[0] << " enp5s0 policy/single_frame/model.onnx reference/bones_072925_test/ --planner-file policy/planner.onnx --obs-config policy/single_frame/observation_config.yaml --disable-crc-check" << std::endl;
     std::cout << "  " << argv[0] << " enp5s0 policy/token/model.onnx reference/bones_072925_test/ --obs-config policy/token/observation_config.yaml --encoder-file policy/token/encoder.onnx" << std::endl;
@@ -4159,6 +4440,7 @@ int main(int argc, char const* argv[]) {
   std::string targetMotionLogfile = "";
   std::string plannerMotionLogfile = "";
   std::string policyInputLogfile = "";
+  std::string encoderInputLogfile = "";
   std::string recordInputFile = "";
   std::string playbackInputFile = "";
   std::string inputType = "keyboard"; // Default to keyboard
@@ -4177,6 +4459,8 @@ int main(int argc, char const* argv[]) {
   std::string zmq_out_topic = "g1_debug";
   std::array<double, 3> initial_compliance = {0.5, 0.5, 0.0}; // initial compliance is 0.5 for both hands (keyboard controllable)
   double initial_max_close_ratio = 1.0; // default allows full closure, use --max-close-ratio to limit
+  bool hoiEnabled = false;
+  std::string residualModelFile = "";
   for (int i = 4; i < argc; i++) {
     if (std::string(argv[i]) == "--disable-crc-check") {
       disableCrcCheck = true;
@@ -4225,6 +4509,12 @@ int main(int argc, char const* argv[]) {
         policyInputLogfile = argv[i + 1];
         std::cout << "[INFO] Using policy input logfile: " << policyInputLogfile << std::endl;
         i++; // Skip the next argument since it's the policy input logfile
+      }
+    } else if (std::string(argv[i]) == "--encoder-input-logfile") {
+      if (i + 1 < argc) {
+        encoderInputLogfile = argv[i + 1];
+        std::cout << "[INFO] Using encoder input logfile: " << encoderInputLogfile << std::endl;
+        i++; // Skip the next argument since it's the encoder input logfile
       }
     } else if (std::string(argv[i]) == "--input-type") {
       if (i + 1 < argc) {
@@ -4406,7 +4696,24 @@ int main(int argc, char const* argv[]) {
         std::cerr << "Error: --max-close-ratio requires a value argument" << std::endl;
         exit(1);
       }
+    } else if (std::string(argv[i]) == "--hoi") {
+      hoiEnabled = true;
+      std::cout << "[INFO] HOI residual mode enabled" << std::endl;
+    } else if (std::string(argv[i]) == "--residual-model") {
+      if (i + 1 < argc) {
+        residualModelFile = argv[i + 1];
+        std::cout << "[INFO] Using residual policy file: " << residualModelFile << std::endl;
+        i++;
+      } else {
+        std::cerr << "Error: --residual-model requires a path argument" << std::endl;
+        exit(1);
+      }
     }
+  }
+
+  if (hoiEnabled && residualModelFile.empty()) {
+    residualModelFile = "policy/release/residual_policy.onnx";
+    std::cout << "[INFO] Using default residual policy file: " << residualModelFile << std::endl;
   }
 
   std::cout << "[DEBUG] Creating G1Deploy object..." << std::endl;
@@ -4421,6 +4728,7 @@ int main(int argc, char const* argv[]) {
     targetMotionLogfile,
     plannerMotionLogfile,
     policyInputLogfile,
+    encoderInputLogfile,
     inputType,
     outputType,
     recordInputFile,
@@ -4438,7 +4746,9 @@ int main(int argc, char const* argv[]) {
     zmq_out_topic,
     enableMotionRecording,
     initial_compliance,
-    initial_max_close_ratio
+    initial_max_close_ratio,
+    hoiEnabled,
+    residualModelFile
   );
   std::cout << "[DEBUG] G1Deploy object created successfully!" << std::endl;
   
@@ -4465,4 +4775,3 @@ int main(int argc, char const* argv[]) {
   std::cout << "[DEBUG] Program exiting normally..." << std::endl;
   return 0;
 }
-

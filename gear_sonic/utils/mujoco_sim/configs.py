@@ -333,6 +333,9 @@ class BaseConfig(ArgsConfigTemplate):
 class SimLoopConfig(BaseConfig):
     """Config for running the simulation loop."""
 
+    hoi: bool = False
+    """是否启用 HOI carry-box 场景。"""
+
     mp_start_method: str = "spawn"
     """Multiprocessing start method"""
 

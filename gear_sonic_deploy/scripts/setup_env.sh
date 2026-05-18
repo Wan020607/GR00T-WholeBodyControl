@@ -163,6 +163,29 @@ if [ -f "src/g1/g1_deploy_onnx_ref/config/fastrtps_profile.xml" ]; then
 fi
 
 # TensorRT Environment Setup
+is_valid_tensorrt_root() {
+    local root="$1"
+    [ -n "$root" ] && [ -f "$root/include/NvInfer.h" ] && [ -d "$root/lib" ]
+}
+
+detect_tensorrt_root() {
+    local candidates=(
+        "$HOME/TensorRT"
+        "/usr/src/tensorrt"
+        "/usr/local/TensorRT"
+        "/opt/TensorRT"
+    )
+
+    for root in "${candidates[@]}"; do
+        if is_valid_tensorrt_root "$root"; then
+            echo "$root"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
 # Check if TensorRT_ROOT is already set, if not try to load from .bashrc
 if [ -z "$TensorRT_ROOT" ] && [ -f "$HOME/.bashrc" ]; then
     # Extract TensorRT_ROOT from .bashrc if it exists
@@ -173,7 +196,17 @@ if [ -z "$TensorRT_ROOT" ] && [ -f "$HOME/.bashrc" ]; then
     fi
 fi
 
-if [ -n "$TensorRT_ROOT" ]; then
+if ! is_valid_tensorrt_root "$TensorRT_ROOT"; then
+    DETECTED_TENSORRT_ROOT=$(detect_tensorrt_root)
+    if [ -n "$DETECTED_TENSORRT_ROOT" ]; then
+        export TensorRT_ROOT="$DETECTED_TENSORRT_ROOT"
+        echo "✅ TensorRT found at: $TensorRT_ROOT"
+    elif [ -n "$TensorRT_ROOT" ]; then
+        echo "⚠️  TensorRT_ROOT is set but invalid: $TensorRT_ROOT"
+    fi
+fi
+
+if is_valid_tensorrt_root "$TensorRT_ROOT"; then
     export LD_LIBRARY_PATH="$TensorRT_ROOT/lib:$LD_LIBRARY_PATH"
     echo "✅ TensorRT environment configured"
     
@@ -344,4 +377,3 @@ echo ""
 if [ -n "$BASH_VERSION" ]; then
     export PS1="(g1_deploy) $PS1"
 fi
-
