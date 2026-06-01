@@ -90,3 +90,29 @@
   这样 `right_shoulder_pitch_joint` 到 `right_wrist_yaw_joint` 会重新使用 `25/25/25/25/25/5/5` 的正确上限，不再误用 `2.45/0.7/...` 的左手手指上限。
 - 当前现象或风险：
   这次修复的是 HOI 仿真侧 body 力矩上限映射错误；如果右臂仍然动作受限，后续需要继续结合 `outputs/sim_joint_debug/*.csv` 检查接触约束和动作目标本身。
+
+## 2026-05-18 ROS2 Planner-Only 接口与 CarryBox One-Shot 动作
+
+- 改动目的：
+  为部署侧新增一套不依赖 VR 输入的 ROS2 planner-only 控制接口，并支持通过 ROS2 触发一次 `sonic_export_carrybox` reference motion 播放。
+- 涉及文件：
+  `gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/CMakeLists.txt`
+  `gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/include/input_interface/ros2_input_handler.hpp`
+  `gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/src/ros2_motion_debugger.cpp`
+  `docs/source/hoi_wan/ros2_debug.md`
+- 核心改动：
+  在 `ROS2InputHandler` 里保留旧的 `ControlPolicy/upper_body_pose` 兼容链路，同时新增：
+  `ControlPolicy/planner_command`
+  `ControlPolicy/action_command`
+  两个 `std_msgs/msg/ByteMultiArray + msgpack` 自定义 payload 话题。
+  `planner_command` 直接下发 planner 使用的 `planner_mode / movement_direction / facing_direction / movement_speed / height / control_action`，目前显式支持：
+  `idle / slow walk / walk / run / squat / kneel`。
+  新增 `ros2_motion_debugger` 可执行文件，默认持续发布 `ControlPolicy/planner_command`，并支持交互式发送 `action carrybox` 触发 one-shot 动作。
+  为了避免旧版 ROS2 调试器触发 VR fallback，`ros2_motion_debugger` 不再发送 `wrist_pose`，`ROS2InputHandler` 也改成只有真正收到 pose / IK 数据时才启用 VR 3-point 输入缓存。
+  `action_command` 的 one-shot 动作播放切换改成两阶段：
+  先按 safety reset 语义退出 planner，把目标参考动作挂到第 0 帧但先不播放；
+  下一控制周期再置 `operator_state.play = true`，从第 0 帧开始播，降低“关 planner 瞬间直接开播”导致的失稳风险。
+  在当前版本里，动作播完后还增加了一条“自动回 planner”的状态机，会在 one-shot 动作结束后自动触发一次 `start_control_`，复用现有 planner 启动路径恢复到 planner 模式。
+- 当前现象或风险：
+  `planner_command` 和 `action_command` 的消息格式目前仍然是项目内部约定的 `msgpack map`，不是标准 `.msg` 类型，所以 `ros2 topic echo` 只能看到字节数组，不能直接看到语义字段。
+  `action carrybox` 的“先挂第 0 帧、下一周期再开播”已经能避免一版明显的切换倒地问题，但“动作播完自动回 planner”这一条回路仍在调试中；如果再次出现自动回切后不稳定或宕机，优先继续排查动作结束后到 planner 初始化之间的状态衔接，而不是直接恢复到旧的同步硬切方式。

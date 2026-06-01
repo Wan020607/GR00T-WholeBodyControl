@@ -1,0 +1,28 @@
+// generated from rosidl_adapter/resource/msg.idl.em
+// with input from benchmark_msg/msg/BenchmarkParams.msg
+// generated code does not contain a copyright notice
+
+
+module benchmark_msg {
+  module msg {
+    struct BenchmarkParams {
+      boolean enable_adaptative;
+
+      boolean full_payload;
+
+      double mu;
+
+      double mu_zone1;
+
+      double mu_zone2;
+
+      double mu_zone3;
+
+      double new_vel_max;
+
+      double new_w_max;
+
+      double dist_obst;
+    };
+  };
+};

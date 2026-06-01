@@ -21,13 +21,20 @@
     <light pos="0 0 1.5" dir="0 0 -1" directional="true"/>
     <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
 
-    <!-- <body name="carry_box" pos="0.05516 -0.32663 0.20" quat="-0.08418835699558258 0.9491671323776245 0.30211615562438965 0.026829907670617104"> -->
-    <body name="carry_box" pos="0.5407390594482422 0.06089213490486145 0.20" quat="0.06260882 -0.47486411 -0.87734837 0.02905261">
+    <!-- <body name="carry_box" pos="0.3407390594482422 0.06089213490486145 0.20" quat="0.06260882 -0.47486411 -0.87734837 0.02905261">
       <freejoint/>
       <inertial pos="0 0 0" mass="4.0" diaginertia="0.002 0.002 0.002"/>
       <geom type="mesh" mesh="largebox_mesh"
         pos="0 0 0" quat="1 0 0 0"
         rgba="0.7 0.8 0.9 0.7"
+        friction="0.9 0.5 0.5"
+        solref="0.02 1"
+        solimp="0.9 0.95 0.001"/> -->
+    <body name="carry_box" pos="0.34431390 0.06446132 0.16" quat="0.03668892 -0.00000000 -0.00000000 -0.99932674">
+      <freejoint/>
+      <inertial pos="0 0 0" mass="4.0" diaginertia="0.002 0.002 0.002"/>
+      <geom type="box" size="0.13 0.16 0.16"
+        rgba="0.9 0.6 0.3 0.8"
         friction="0.9 0.5 0.5"
         solref="0.02 1"
         solimp="0.9 0.95 0.001"/>

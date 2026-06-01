@@ -40,6 +40,7 @@ endif()
 
 file(GLOB_RECURSE PROJECT_SRCS ${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp)
 list(REMOVE_ITEM PROJECT_SRCS ${CMAKE_CURRENT_SOURCE_DIR}/src/g1_deploy_onnx_ref.cpp)
+list(REMOVE_ITEM PROJECT_SRCS ${CMAKE_CURRENT_SOURCE_DIR}/src/ros2_motion_debugger.cpp)
 
 
 # Optional AddressSanitizer support
@@ -225,6 +226,21 @@ if(rclcpp_FOUND AND std_msgs_FOUND)
   target_include_directories(${EXECUTABLE_NAME} PRIVATE ${ROS2_INCLUDE_DIRS} ${MSGPACK_INCLUDE_DIRS})
   target_link_libraries(${EXECUTABLE_NAME} PRIVATE ${ROS2_LIBS} pthread)
   target_compile_definitions(${EXECUTABLE_NAME} PRIVATE HAS_ROS2=1)
+
+  set(ROS2_DEBUGGER_EXECUTABLE ros2_motion_debugger)
+  add_executable(${ROS2_DEBUGGER_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/src/ros2_motion_debugger.cpp)
+  target_include_directories(${ROS2_DEBUGGER_EXECUTABLE} PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${ROS2_INCLUDE_DIRS}
+    ${MSGPACK_INCLUDE_DIRS})
+  target_link_libraries(${ROS2_DEBUGGER_EXECUTABLE} PRIVATE ${ROS2_LIBS} pthread)
+  set_target_properties(
+    ${ROS2_DEBUGGER_EXECUTABLE}
+    PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/target/release/"
+               OUTPUT_NAME ${ROS2_DEBUGGER_EXECUTABLE}
+               CXX_STANDARD 20
+               CXX_STANDARD_REQUIRED ON
+               CXX_EXTENSIONS OFF)
   
   message(STATUS "✅ ROS2InputHandler support enabled with msgpack")
 else()

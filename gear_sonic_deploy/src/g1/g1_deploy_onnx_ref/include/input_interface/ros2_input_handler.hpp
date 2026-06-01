@@ -86,6 +86,7 @@ struct ControlGoalMsg {
     /// Wrist pose in [x,y,z, qw,qx,qy,qz] × 2 (left then right).
     std::array<double, 14> wrist_pose = {0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0,
                                           0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0};
+    bool has_wrist_pose = false;  ///< True if wrist_pose was explicitly provided.
     
     // IK-processed wrist poses (4×4 transformation matrices, row-major flattened)
     std::array<double, 16> left_wrist_after_ik = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};   ///< Left wrist after IK.
@@ -109,6 +110,34 @@ struct ControlGoalMsg {
     
     double ros_timestamp = 0.0;  ///< ROS time in seconds (for synchronisation with other components).
     bool valid = false;           ///< True once the message has been successfully parsed.
+};
+
+/**
+ * @brief Direct planner command for the planner-only ROS 2 topic.
+ *
+ * This is intentionally separate from ControlGoalMsg so locomotion control can
+ * be driven without reusing the VR / upper-body teleop schema.
+ */
+struct PlannerCommandMsg {
+    int planner_mode = static_cast<int>(LocomotionMode::IDLE);   ///< Desired planner locomotion mode.
+    std::array<double, 3> movement_direction = {0.0, 0.0, 0.0}; ///< Desired movement direction [x,y,z].
+    std::array<double, 3> facing_direction = {1.0, 0.0, 0.0};   ///< Desired facing direction [x,y,z].
+    double movement_speed = -1.0;                                ///< Desired speed (-1 = planner default).
+    double height = -1.0;                                        ///< Desired body height (-1 = planner default).
+    int control_action = 0;                                      ///< 0=none, 1=start, 2=stop, 3=toggle.
+    double ros_timestamp = 0.0;                                  ///< ROS time in seconds.
+    bool valid = false;                                          ///< True once the message has been parsed.
+};
+
+/**
+ * @brief One-shot reference-motion command for ROS 2 action playback.
+ */
+struct ActionCommandMsg {
+    std::string action = "";          ///< Supported: "play_once".
+    std::string motion_name = "";     ///< Motion name in MotionDataReader.
+    uint64_t request_id = 0;          ///< Optional deduplication id.
+    double ros_timestamp = 0.0;       ///< ROS time in seconds.
+    bool valid = false;               ///< True once the message has been parsed.
 };
 
 /**
@@ -164,14 +193,15 @@ public:
             setup_subscribers();
             
             if constexpr (DEBUG_LOGGING) {
-                std::cout << "[ROS2 DEBUG] Subscribed to topic: ControlPolicy/upper_body_pose" << std::endl;
+                std::cout << "[ROS2 DEBUG] Subscribed to topics: ControlPolicy/upper_body_pose, "
+                          << "ControlPolicy/planner_command, ControlPolicy/action_command" << std::endl;
             }
         } catch (const std::exception& e) {
             std::cerr << "[ROS2 ERROR] Failed to initialize ROS2InputHandler: " << e.what() << std::endl;
             throw;
         }
         type_ = InputType::ROS2;
-        has_vr_3point_control_ = true;
+        has_vr_3point_control_ = false;
         use_ik_mode_ = use_ik_mode;
     }
 
@@ -198,6 +228,18 @@ public:
                     std::cout << "[ROS2 DEBUG] Resetting control goal subscriber" << std::endl;
                 }
                 control_goal_sub_.reset();
+            }
+            if (planner_command_sub_) {
+                if constexpr (DEBUG_LOGGING) {
+                    std::cout << "[ROS2 DEBUG] Resetting planner command subscriber" << std::endl;
+                }
+                planner_command_sub_.reset();
+            }
+            if (action_command_sub_) {
+                if constexpr (DEBUG_LOGGING) {
+                    std::cout << "[ROS2 DEBUG] Resetting action command subscriber" << std::endl;
+                }
+                action_command_sub_.reset();
             }
             
             // Step 3: Allow DDS cleanup time (critical for preventing assertion)
@@ -316,6 +358,19 @@ public:
                 planner_facing_angle_ = 0.0; // Reset facing angle
             }
         }
+        if (received_planner_command_.load()) {
+            int64_t current_time_ns = std::chrono::steady_clock::now().time_since_epoch().count();
+            int64_t last_msg_time_ns = last_planner_command_time_ns_.load();
+            double time_since_last_msg = (current_time_ns - last_msg_time_ns) / 1e9;
+            if (time_since_last_msg > CONTROL_GOAL_TIMEOUT) {
+                if constexpr (DEBUG_LOGGING) {
+                    std::cout << "[ROS2 WARNING] Planner command timeout (" << time_since_last_msg
+                              << "s since last message). Resetting planner command state." << std::endl;
+                }
+                received_planner_command_.store(false);
+                use_direct_planner_command_ = false;
+            }
+        }
 
         // Read from control goal buffer (teleop commands from Python) - thread-safe
         if (received_control_goal_.load()) {
@@ -367,9 +422,16 @@ public:
                 right_hand_joint_.SetData(control_goal_buffer_.right_hand_joint);
                 has_hand_joints_ = true;
             }
+
+            const bool has_any_vr_data =
+                control_goal_buffer_.has_ik_data ||
+                control_goal_buffer_.has_wrist_matrices ||
+                control_goal_buffer_.has_wrist_pose;
+            has_vr_3point_control_ = has_any_vr_data;
             
             // Update VR 3-point control data based on use_ik_mode_ flag
             // Build arrays first, then call SetData() on buffers
+            if (has_any_vr_data) {
             std::array<double, 9> vr_position;
             std::array<double, 12> vr_orientation;
             
@@ -469,7 +531,7 @@ public:
                 // Update buffers
                 vr_3point_position_.SetData(vr_position);
                 vr_3point_orientation_.SetData(vr_orientation);
-            } else {
+            } else if (control_goal_buffer_.has_wrist_pose) {
                 // Fallback: Use standard wrist_pose format (14 doubles)
                 vr_position[0] = control_goal_buffer_.wrist_pose[0];  // left wrist x
                 vr_position[1] = control_goal_buffer_.wrist_pose[1];  // left wrist y
@@ -515,6 +577,7 @@ public:
                     // Data availability flags
                     std::cout << "  Data flags: has_ik_data=" << (control_goal_buffer_.has_ik_data ? "true" : "false")
                               << ", has_wrist_matrices=" << (control_goal_buffer_.has_wrist_matrices ? "true" : "false")
+                              << ", has_wrist_pose=" << (control_goal_buffer_.has_wrist_pose ? "true" : "false")
                               << ", has_hand_joints=" << (has_hand_joints_ ? "true" : "false")
                               << ", use_ik_mode=" << (use_ik_mode_ ? "true" : "false") << std::endl;
                     
@@ -551,9 +614,67 @@ public:
                     }
                 }
             }
+            }
         } else {
             // No control goal data available
             use_teleop_navigate_cmd_ = false;
+            has_vr_3point_control_ = false;
+        }
+
+        if (received_planner_command_.load()) {
+            std::lock_guard<std::mutex> lock(planner_command_mutex_);
+            direct_planner_mode_ = sanitize_planner_mode(planner_command_buffer_.planner_mode);
+            direct_planner_movement_direction_ =
+                normalize_planar_vector(planner_command_buffer_.movement_direction, false);
+            direct_planner_facing_direction_ =
+                normalize_planar_vector(planner_command_buffer_.facing_direction, true);
+            direct_planner_speed_ = planner_command_buffer_.movement_speed;
+            direct_planner_height_ = planner_command_buffer_.height;
+            use_direct_planner_command_ = true;
+            planner_facing_angle_ = std::atan2(direct_planner_facing_direction_[1], direct_planner_facing_direction_[0]);
+
+            if (planner_command_buffer_.control_action != 0) {
+                switch (planner_command_buffer_.control_action) {
+                    case 1:
+                        control_is_active_ = true;
+                        start_control_ = true;
+                        break;
+                    case 2:
+                        control_is_active_ = false;
+                        stop_control_ = true;
+                        break;
+                    case 3:
+                        control_is_active_ = !control_is_active_;
+                        if (control_is_active_) {
+                            start_control_ = true;
+                        } else {
+                            stop_control_ = true;
+                        }
+                        break;
+                    default:
+                        break;
+                }
+                planner_command_buffer_.control_action = 0;
+            }
+
+            if constexpr (DEBUG_LOGGING) {
+                static int planner_command_debug_counter = 0;
+                planner_command_debug_counter++;
+                if (planner_command_debug_counter % 50 == 0) {
+                    std::cout << "[ROS2 DEBUG] Planner command update:" << std::endl;
+                    std::cout << "  planner_mode: " << direct_planner_mode_ << std::endl;
+                    std::cout << "  movement_direction: [" << direct_planner_movement_direction_[0] << ", "
+                              << direct_planner_movement_direction_[1] << ", "
+                              << direct_planner_movement_direction_[2] << "]" << std::endl;
+                    std::cout << "  facing_direction: [" << direct_planner_facing_direction_[0] << ", "
+                              << direct_planner_facing_direction_[1] << ", "
+                              << direct_planner_facing_direction_[2] << "]" << std::endl;
+                    std::cout << "  movement_speed: " << direct_planner_speed_ << std::endl;
+                    std::cout << "  height: " << direct_planner_height_ << std::endl;
+                }
+            }
+        } else {
+            use_direct_planner_command_ = false;
         }
     }
 
@@ -655,16 +776,87 @@ public:
             }
         }
 
-        // Check if planner is loaded (required for ROS2 mode)
-        if (!has_planner) {
-            std::cerr << "[ROS2 ERROR] Planner not loaded - ROS2 mode requires planner. Stopping control." << std::endl;
-            operator_state.stop = true;
-            return;
-        }
-
         // Handle control start/stop
         if (this->stop_control_) { operator_state.stop = true; }
         if (this->report_temperature_flag_) { report_temperature = true; }
+        if (operator_state.stop) {
+            return;
+        }
+
+        if (action_playback_active_ &&
+            !action_playback_start_pending_ &&
+            !operator_state.play &&
+            current_frame == 0 &&
+            current_motion &&
+            current_motion->name == action_playback_motion_name_) {
+            action_playback_active_ = false;
+            start_control_ = true;
+            std::cout << "[ROS2] Reference motion completed, returning to planner" << std::endl;
+        }
+
+        if (action_playback_start_pending_) {
+            {
+                std::lock_guard<std::mutex> lock(current_motion_mutex);
+                current_frame = 0;
+                operator_state.play = true;
+            }
+            action_playback_start_pending_ = false;
+            action_playback_active_ = true;
+            std::cout << "[ROS2] Starting reference motion playback from frame 0: "
+                      << action_playback_motion_name_ << std::endl;
+            return;
+        }
+
+        ActionCommandMsg pending_action;
+        bool has_pending_action = false;
+        {
+            std::lock_guard<std::mutex> lock(action_command_mutex_);
+            if (action_command_pending_) {
+                pending_action = action_command_buffer_;
+                action_command_pending_ = false;
+                has_pending_action = true;
+            }
+        }
+
+        if (has_pending_action) {
+            const std::string motion_name =
+                pending_action.motion_name.empty() ? DEFAULT_ACTION_MOTION_NAME : pending_action.motion_name;
+            auto action_motion = motion_reader.GetMotion(motion_name);
+            if (!action_motion) {
+                std::cerr << "[ROS2 ERROR] Action motion not found: " << motion_name << std::endl;
+            } else {
+                movement_state_buffer.SetData(MovementState(static_cast<int>(LocomotionMode::IDLE),
+                                                           {0.0f, 0.0f, 0.0f},
+                                                           {1.0f, 0.0f, 0.0f},
+                                                           -1.0f,
+                                                           -1.0f));
+                {
+                    std::lock_guard<std::mutex> lock(current_motion_mutex);
+                    operator_state.play = false;
+                    reinitialize_heading = true;
+                    current_motion = action_motion;
+                    current_frame = 0;
+                    if (has_planner && planner_state.enabled) {
+                        planner_state.enabled = false;
+                        planner_state.initialized = false;
+                        std::cout << "[ROS2] Safety reset: Planner disabled before reference motion playback" << std::endl;
+                    }
+                }
+                action_playback_motion_name_ = motion_name;
+                action_playback_active_ = false;
+                action_playback_start_pending_ = true;
+                std::cout << "[ROS2] Safety reset: primed reference motion frame 0 for playback: "
+                          << motion_name << std::endl;
+            }
+            return;
+        }
+
+        // Check if planner is loaded when ROS2 is driving planner commands.
+        if ((this->start_control_ || use_direct_planner_command_ || use_teleop_navigate_cmd_) && !has_planner) {
+            std::cerr << "[ROS2 ERROR] Planner not loaded - planner ROS2 commands require a planner. Stopping control." << std::endl;
+            operator_state.stop = true;
+            return;
+        }
 
         // Handle control start
         if (this->start_control_) { 
@@ -716,20 +908,26 @@ public:
 
         if (planner_state.enabled && planner_state.initialized) {
             
-            // Set final movement values from navigate_cmd
+            // Set final movement values from either the planner-only topic or the
+            // legacy navigate_cmd teleop topic.
             int final_mode = static_cast<int>(LocomotionMode::IDLE);
             std::array<double, 3> final_movement = {0.0, 0.0, 0.0};
             std::array<double, 3> final_facing_direction = {1.0, 0.0, 0.0};
-            double final_speed = 0.0;
+            double final_speed = -1.0;
             double final_height = -1.0;
-            
-            // Get and process base_height_command (thread-safe copy)
-            double base_height = base_height_command_;
-            // Clip to valid range [0.1, 0.88]
-            base_height = std::clamp(base_height, 0.1, 0.88);
-            
-            // Convert navigate_cmd to movement direction and mode
-            if (use_teleop_navigate_cmd_) {
+
+            if (use_direct_planner_command_) {
+                final_mode = direct_planner_mode_;
+                final_movement = direct_planner_movement_direction_;
+                final_facing_direction = direct_planner_facing_direction_;
+                final_speed = sanitize_planner_speed(static_cast<LocomotionMode>(final_mode), direct_planner_speed_);
+                final_height = sanitize_planner_height(static_cast<LocomotionMode>(final_mode), direct_planner_height_);
+            } else if (use_teleop_navigate_cmd_) {
+                // Get and process base_height_command (thread-safe copy)
+                double base_height = base_height_command_;
+                // Clip to valid range [0.1, 0.88]
+                base_height = std::clamp(base_height, 0.1, 0.88);
+
                 // navigate_cmd format: [lin_vel_x, lin_vel_y, ang_vel_z]
                 // Convert to movement_direction and mode
                 double lin_vel_x = navigate_cmd_from_teleop_[0];
@@ -808,14 +1006,21 @@ public:
                 debug_counter++;
                 if (debug_counter % 50 == 0) {  // Log every 50 calls to avoid spam
                     std::cout << "[ROS2 DEBUG] Planner control values:" << std::endl;
-                    if (use_teleop_navigate_cmd_) {
+                    if (use_direct_planner_command_) {
+                        std::cout << "  Source: planner_command" << std::endl;
+                    } else if (use_teleop_navigate_cmd_) {
+                        std::cout << "  Source: upper_body_pose" << std::endl;
                         std::cout << "  Input navigate_cmd: [" << navigate_cmd_from_teleop_[0] << ", " 
                                   << navigate_cmd_from_teleop_[1] << ", " << navigate_cmd_from_teleop_[2] << "]" << std::endl;
                         std::cout << "  Facing angle: " << planner_facing_angle_ << " rad (" 
                                   << (planner_facing_angle_ * 180.0 / M_PI) << " deg)" << std::endl;
                     }
-                    std::cout << "  Base height command: " << base_height_command_ 
-                              << " (clamped: " << std::clamp(base_height_command_, 0.1, 0.88) << ")" << std::endl;
+                    if (use_direct_planner_command_) {
+                        std::cout << "  Requested height: " << direct_planner_height_ << std::endl;
+                    } else {
+                        std::cout << "  Base height command: " << base_height_command_ 
+                                  << " (clamped: " << std::clamp(base_height_command_, 0.1, 0.88) << ")" << std::endl;
+                    }
                     std::cout << "  Final mode: " << final_mode << " (0=idle, 1=slow, 2=walk, 3=run, 4=squat, 6=kneel)" << std::endl;
                     std::cout << "  Final speed: " << final_speed << std::endl;
                     std::cout << "  Final height: " << final_height << std::endl;
@@ -860,6 +1065,8 @@ private:
 
     /// Subscription to `ControlPolicy/upper_body_pose` (ByteMultiArray, msgpack).
     rclcpp::Subscription<std_msgs::msg::ByteMultiArray>::SharedPtr control_goal_sub_;
+    rclcpp::Subscription<std_msgs::msg::ByteMultiArray>::SharedPtr planner_command_sub_;
+    rclcpp::Subscription<std_msgs::msg::ByteMultiArray>::SharedPtr action_command_sub_;
 
     // ------------------------------------------------------------------
     // Thread-safe receiving buffer (written by callback, read by update())
@@ -868,7 +1075,19 @@ private:
     std::mutex control_goal_mutex_;                     ///< Guards control_goal_buffer_.
     std::atomic<bool> received_control_goal_{false};   ///< True once at least one message arrived.
     std::atomic<int64_t> last_control_goal_time_ns_{0}; ///< Monotonic timestamp of last message (ns).
+    PlannerCommandMsg planner_command_buffer_;          ///< Latest planner-only command message.
+    std::mutex planner_command_mutex_;                  ///< Guards planner_command_buffer_.
+    std::atomic<bool> received_planner_command_{false}; ///< True once at least one planner command arrived.
+    std::atomic<int64_t> last_planner_command_time_ns_{0}; ///< Monotonic timestamp of last planner command.
+    ActionCommandMsg action_command_buffer_;            ///< Latest one-shot action command.
+    std::mutex action_command_mutex_;                   ///< Guards action_command_buffer_.
+    bool action_command_pending_ = false;               ///< True when a one-shot action must be consumed.
+    uint64_t last_action_request_id_ = 0;               ///< Deduplication for one-shot actions.
+    bool action_playback_start_pending_ = false;        ///< Delay playback by one control cycle after priming frame 0.
+    bool action_playback_active_ = false;               ///< True while a one-shot reference motion is in progress.
+    std::string action_playback_motion_name_ = "";      ///< Motion armed for one-shot playback.
     static constexpr double CONTROL_GOAL_TIMEOUT = 1.0; ///< Seconds before a timeout reset.
+    static constexpr const char* DEFAULT_ACTION_MOTION_NAME = "sonic_export_carrybox";
     
     /// When true, use IK-processed transformation matrices for VR position;
     /// when false, use raw left_wrist / right_wrist matrices.
@@ -893,6 +1112,12 @@ private:
     std::array<double, 3> navigate_cmd_from_teleop_ = {0.0, 0.0, 0.0};  ///< [lin_x, lin_y, ang_z].
     bool use_teleop_navigate_cmd_ = false;   ///< True while navigate_cmd is valid.
     double base_height_command_ = 0.78;      ///< Thread-safe copy of base_height_command.
+    bool use_direct_planner_command_ = false; ///< True while planner-only command is valid.
+    int direct_planner_mode_ = static_cast<int>(LocomotionMode::IDLE);
+    std::array<double, 3> direct_planner_movement_direction_ = {0.0, 0.0, 0.0};
+    std::array<double, 3> direct_planner_facing_direction_ = {1.0, 0.0, 0.0};
+    double direct_planner_speed_ = -1.0;
+    double direct_planner_height_ = -1.0;
     
     /// Accumulated facing angle (radians), integrated from ang_vel_z each frame.
     double planner_facing_angle_ = 0.0;
@@ -941,6 +1166,7 @@ private:
                 auto wrist_arr = map_data["wrist_pose"].as<std::vector<double>>();
                 if (wrist_arr.size() >= 14) {
                     std::copy_n(wrist_arr.begin(), 14, msg.wrist_pose.begin());
+                    msg.has_wrist_pose = true;
                 }
             }
             
@@ -1093,6 +1319,152 @@ private:
         
         return msg;
     }
+
+    PlannerCommandMsg parse_msgpack_planner_command(const std::vector<uint8_t>& data) {
+        PlannerCommandMsg msg;
+        msg.valid = false;
+
+        try {
+            msgpack::object_handle oh = msgpack::unpack(reinterpret_cast<const char*>(data.data()), data.size());
+            msgpack::object deserialized = oh.get();
+            if (deserialized.type != msgpack::type::MAP) {
+                return msg;
+            }
+
+            std::map<std::string, msgpack::object> map_data;
+            deserialized.convert(map_data);
+
+            if (map_data.count("planner_mode")) {
+                msg.planner_mode = map_data["planner_mode"].as<int>();
+            }
+            if (map_data.count("movement_direction") && map_data["movement_direction"].type == msgpack::type::ARRAY) {
+                auto arr = map_data["movement_direction"].as<std::vector<double>>();
+                if (arr.size() >= 3) {
+                    std::copy_n(arr.begin(), 3, msg.movement_direction.begin());
+                }
+            }
+            if (map_data.count("facing_direction") && map_data["facing_direction"].type == msgpack::type::ARRAY) {
+                auto arr = map_data["facing_direction"].as<std::vector<double>>();
+                if (arr.size() >= 3) {
+                    std::copy_n(arr.begin(), 3, msg.facing_direction.begin());
+                }
+            }
+            if (map_data.count("movement_speed")) {
+                msg.movement_speed = map_data["movement_speed"].as<double>();
+            }
+            if (map_data.count("height")) {
+                msg.height = map_data["height"].as<double>();
+            }
+            if (map_data.count("control_action")) {
+                msg.control_action = map_data["control_action"].as<int>();
+            }
+            if (map_data.count("ros_timestamp")) {
+                msg.ros_timestamp = map_data["ros_timestamp"].as<double>();
+            }
+
+            msg.valid = true;
+        } catch (const std::exception& e) {
+            std::cerr << "[ROS2 ERROR] planner_command msgpack parsing failed: " << e.what() << std::endl;
+            msg.valid = false;
+        }
+
+        return msg;
+    }
+
+    ActionCommandMsg parse_msgpack_action_command(const std::vector<uint8_t>& data) {
+        ActionCommandMsg msg;
+        msg.valid = false;
+
+        try {
+            msgpack::object_handle oh = msgpack::unpack(reinterpret_cast<const char*>(data.data()), data.size());
+            msgpack::object deserialized = oh.get();
+            if (deserialized.type != msgpack::type::MAP) {
+                return msg;
+            }
+
+            std::map<std::string, msgpack::object> map_data;
+            deserialized.convert(map_data);
+
+            if (map_data.count("action")) {
+                msg.action = map_data["action"].as<std::string>();
+            }
+            if (map_data.count("motion_name")) {
+                msg.motion_name = map_data["motion_name"].as<std::string>();
+            }
+            if (map_data.count("request_id")) {
+                msg.request_id = map_data["request_id"].as<uint64_t>();
+            }
+            if (map_data.count("ros_timestamp")) {
+                msg.ros_timestamp = map_data["ros_timestamp"].as<double>();
+            }
+
+            msg.valid = !msg.action.empty();
+        } catch (const std::exception& e) {
+            std::cerr << "[ROS2 ERROR] action_command msgpack parsing failed: " << e.what() << std::endl;
+            msg.valid = false;
+        }
+
+        return msg;
+    }
+
+    int sanitize_planner_mode(int requested_mode) const {
+        switch (requested_mode) {
+            case static_cast<int>(LocomotionMode::IDLE):
+            case static_cast<int>(LocomotionMode::SLOW_WALK):
+            case static_cast<int>(LocomotionMode::WALK):
+            case static_cast<int>(LocomotionMode::RUN):
+            case static_cast<int>(LocomotionMode::IDEL_SQUAT):
+            case static_cast<int>(LocomotionMode::IDEL_KNEEL):
+                return requested_mode;
+            default:
+                return static_cast<int>(LocomotionMode::IDLE);
+        }
+    }
+
+    std::array<double, 3> normalize_planar_vector(const std::array<double, 3>& input, bool default_forward) const {
+        std::array<double, 3> output = input;
+        output[2] = 0.0;
+        const double norm = std::sqrt(output[0] * output[0] + output[1] * output[1]);
+        if (norm < 1e-6) {
+            return default_forward ? std::array<double, 3>{1.0, 0.0, 0.0}
+                                   : std::array<double, 3>{0.0, 0.0, 0.0};
+        }
+        output[0] /= norm;
+        output[1] /= norm;
+        return output;
+    }
+
+    double sanitize_planner_speed(LocomotionMode mode, double requested_speed) const {
+        if (is_static_motion_mode(mode)) {
+            return -1.0;
+        }
+        if (requested_speed < 0.0) {
+            return -1.0;
+        }
+        if (mode == LocomotionMode::SLOW_WALK) {
+            return std::clamp(requested_speed, 0.2, 0.8);
+        }
+        if (mode == LocomotionMode::RUN) {
+            return std::clamp(requested_speed, 1.5, 3.0);
+        }
+        return requested_speed;
+    }
+
+    double sanitize_planner_height(LocomotionMode mode, double requested_height) const {
+        if (is_standing_motion_mode(mode)) {
+            return -1.0;
+        }
+        if (requested_height < 0.0) {
+            if (mode == LocomotionMode::IDEL_SQUAT) {
+                return 0.6;
+            }
+            if (mode == LocomotionMode::IDEL_KNEEL) {
+                return 0.3;
+            }
+            return -1.0;
+        }
+        return std::clamp(requested_height, 0.1, 0.88);
+    }
     
     /**
      * @brief Extract the 3×3 rotation matrix from a flattened row-major 4×4 transform.
@@ -1236,6 +1608,66 @@ private:
         }
     }
 
+    void planner_command_callback(std::shared_ptr<const std_msgs::msg::ByteMultiArray> msg) {
+        try {
+            std::vector<uint8_t> data(msg->data.begin(), msg->data.end());
+            PlannerCommandMsg planner_msg = parse_msgpack_planner_command(data);
+
+            if (planner_msg.valid) {
+                {
+                    std::lock_guard<std::mutex> lock(planner_command_mutex_);
+                    int prev_control_action = planner_command_buffer_.control_action;
+                    planner_command_buffer_ = planner_msg;
+                    if (planner_msg.control_action == 0) {
+                        planner_command_buffer_.control_action = prev_control_action;
+                    }
+                }
+                received_planner_command_.store(true);
+                last_planner_command_time_ns_.store(std::chrono::steady_clock::now().time_since_epoch().count());
+            } else if constexpr (DEBUG_LOGGING) {
+                std::cout << "[ROS2 DEBUG] Invalid planner command message received" << std::endl;
+            }
+        } catch (const std::exception& e) {
+            if constexpr (DEBUG_LOGGING) {
+                std::cout << "[ROS2 ERROR] Failed to process planner command message: " << e.what() << std::endl;
+            }
+        }
+    }
+
+    void action_command_callback(std::shared_ptr<const std_msgs::msg::ByteMultiArray> msg) {
+        try {
+            std::vector<uint8_t> data(msg->data.begin(), msg->data.end());
+            ActionCommandMsg action_msg = parse_msgpack_action_command(data);
+
+            if (!action_msg.valid) {
+                if constexpr (DEBUG_LOGGING) {
+                    std::cout << "[ROS2 DEBUG] Invalid action command message received" << std::endl;
+                }
+                return;
+            }
+            if (action_msg.action != "play_once") {
+                if constexpr (DEBUG_LOGGING) {
+                    std::cout << "[ROS2 DEBUG] Unsupported action command: " << action_msg.action << std::endl;
+                }
+                return;
+            }
+
+            std::lock_guard<std::mutex> lock(action_command_mutex_);
+            if (action_msg.request_id != 0 && action_msg.request_id == last_action_request_id_) {
+                return;
+            }
+            action_command_buffer_ = action_msg;
+            action_command_pending_ = true;
+            if (action_msg.request_id != 0) {
+                last_action_request_id_ = action_msg.request_id;
+            }
+        } catch (const std::exception& e) {
+            if constexpr (DEBUG_LOGGING) {
+                std::cout << "[ROS2 ERROR] Failed to process action command message: " << e.what() << std::endl;
+            }
+        }
+    }
+
     // Helper method to initialize ROS2 subscriber
     void setup_subscribers() {
         // Create subscriber for control goal topic (teleop commands from Python)
@@ -1249,6 +1681,27 @@ private:
         
         if constexpr (DEBUG_LOGGING) {
             std::cout << "[ROS2 DEBUG] Control goal subscriber created for topic: ControlPolicy/upper_body_pose" << std::endl;
+        }
+
+        planner_command_sub_ = node_->create_subscription<std_msgs::msg::ByteMultiArray>(
+            "ControlPolicy/planner_command",
+            1,
+            [this](std::shared_ptr<const std_msgs::msg::ByteMultiArray> msg) {
+                this->planner_command_callback(msg);
+            }
+        );
+
+        action_command_sub_ = node_->create_subscription<std_msgs::msg::ByteMultiArray>(
+            "ControlPolicy/action_command",
+            1,
+            [this](std::shared_ptr<const std_msgs::msg::ByteMultiArray> msg) {
+                this->action_command_callback(msg);
+            }
+        );
+
+        if constexpr (DEBUG_LOGGING) {
+            std::cout << "[ROS2 DEBUG] Planner command subscriber created for topic: ControlPolicy/planner_command" << std::endl;
+            std::cout << "[ROS2 DEBUG] Action command subscriber created for topic: ControlPolicy/action_command" << std::endl;
         }
     }
 
@@ -1270,6 +1723,21 @@ private:
      *    - locomotion_mode: int (0 = slow walk with custom speed, 1 = fast walk with default speed)
      *    - ros_timestamp: double (ROS time in seconds for synchronization)
      *    - valid: bool (message validity flag)
+     *
+     * ControlPolicy/planner_command (std_msgs/ByteMultiArray) - msgpack-serialized PlannerCommandMsg:
+     *    - planner_mode: int (0=idle, 1=slow walk, 2=walk, 3=run, 4=squat, 6=kneel)
+     *    - movement_direction: double[3]
+     *    - facing_direction: double[3]
+     *    - movement_speed: double (-1 = planner default)
+     *    - height: double (-1 = planner default)
+     *    - control_action: int (0=none, 1=start, 2=stop, 3=toggle)
+     *    - ros_timestamp: double
+     *
+     * ControlPolicy/action_command (std_msgs/ByteMultiArray) - msgpack-serialized ActionCommandMsg:
+     *    - action: string ("play_once")
+     *    - motion_name: string
+     *    - request_id: uint64
+     *    - ros_timestamp: double
      */
 };
 

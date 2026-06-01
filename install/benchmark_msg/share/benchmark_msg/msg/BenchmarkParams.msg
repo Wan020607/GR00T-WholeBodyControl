@@ -1,0 +1,9 @@
+bool enable_adaptative
+bool full_payload
+float64 mu
+float64 mu_zone1
+float64 mu_zone2
+float64 mu_zone3
+float64 new_vel_max
+float64 new_w_max
+float64 dist_obst
