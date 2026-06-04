@@ -244,7 +244,7 @@ MOTION_DATA_DEFAULT="reference/example/"
 INPUT_TYPE_DEFAULT="manager"
 OUTPUT_TYPE_DEFAULT="all"
 ZMQ_HOST_DEFAULT="localhost"
-RESIDUAL_MODEL_DEFAULT="policy/release/residual_policy_real_05_29_17_44.onnx"
+RESIDUAL_MODEL_DEFAULT="policy/release/residual_policy_real.onnx"
 HOI_ENABLED=false
 
 # Initialize with defaults (will be set after parsing)

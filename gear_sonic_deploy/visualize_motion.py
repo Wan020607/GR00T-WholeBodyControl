@@ -14,6 +14,27 @@ import zmq
 import threading
 import msgpack
 
+
+def safe_array(value, shape, fallback):
+    try:
+        arr = np.asarray(value, dtype=np.float64)
+    except (TypeError, ValueError):
+        return np.asarray(fallback, dtype=np.float64).reshape(shape)
+    if arr.size != int(np.prod(shape)) or not np.all(np.isfinite(arr)):
+        return np.asarray(fallback, dtype=np.float64).reshape(shape)
+    return arr.reshape(shape)
+
+
+def normalize_quat_wxyz(quat):
+    try:
+        quat = np.asarray(quat, dtype=np.float64).reshape(4)
+    except (TypeError, ValueError):
+        return np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+    norm = np.linalg.norm(quat)
+    if norm <= 1.0e-8 or not np.isfinite(norm):
+        return np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+    return quat / norm
+
 def key_call_back(keycode):
     global \
         curr_start, \
@@ -117,31 +138,37 @@ def load_anim_data(csv_path: str):
     return ret
 
 
-def receive_realtime_debug_messages(socket, data_csv_dicts, topic):
+def receive_realtime_debug_messages(socket, data_csv_dicts, topic, data_lock):
     while True:
         message = socket.recv()
 
         # Remove any header or leading bytes (should be exactly 8 bytes for "g1_debug")
-        data = message.split(topic.encode())[1]
+        if topic.encode() not in message:
+            continue
+        data = message.split(topic.encode(), 1)[1]
 
         result = msgpack.unpackb(data)
 
-        data_csv_dicts[0]["root_trans_offset"][0, ...] = result["base_trans_target"]
-        data_csv_dicts[0]["root_rot"][0, ...] = result["base_quat_target"]
-        data_csv_dicts[0]["dof"][0, ...] = result["body_q_target"]
-
-        data_csv_dicts[0]["root_trans_offset_measured"][0, ...] = result["base_trans_measured"]
-        data_csv_dicts[0]["root_rot_measured"][0, ...] = result["base_quat_measured"]
-        data_csv_dicts[0]["dof_measured"][0, ...] = result["body_q_measured"]
-
-        data_csv_dicts[0]["vr_3point_position"] = np.array(result["vr_3point_position"]).reshape(3,3)
-        data_csv_dicts[0]["vr_3point_orientation"] = np.array(result["vr_3point_orientation"]).reshape(3,4)
-        data_csv_dicts[0]["vr_3point_compliance"] = np.array(result["vr_3point_compliance"]).reshape(3)
+        next_data = {
+            "root_trans_offset": safe_array(result.get("base_trans_target"), (1, 3), [[0.0, 0.0, 0.9]]),
+            "root_rot": normalize_quat_wxyz(result.get("base_quat_target")).reshape(1, 4),
+            "dof": safe_array(result.get("body_q_target"), (1, 29), np.zeros((1, 29))),
+            "root_trans_offset_measured": safe_array(result.get("base_trans_measured"), (1, 3), [[0.0, 0.0, 0.0]]),
+            "root_rot_measured": normalize_quat_wxyz(result.get("base_quat_measured")).reshape(1, 4),
+            "dof_measured": safe_array(result.get("body_q_measured"), (1, 29), np.zeros((1, 29))),
+            "vr_3point_position": safe_array(result.get("vr_3point_position"), (3, 3), np.zeros((3, 3))),
+            "vr_3point_orientation": safe_array(result.get("vr_3point_orientation"), (3, 4), np.zeros((3, 4))),
+            "vr_3point_compliance": safe_array(result.get("vr_3point_compliance"), (3,), np.zeros(3)),
+        }
 
         if "motor_temperature" in result:
-            temps = np.array(result["motor_temperature"])
+            temps = np.asarray(result["motor_temperature"], dtype=np.float64)
             # 58 values: 29 motors × 2 (winding, driver). Take max per motor.
-            data_csv_dicts[0]["motor_temperature"] = np.maximum(temps[0::2], temps[1::2])  # shape (29,)
+            if temps.size >= 58 and np.all(np.isfinite(temps[:58])):
+                next_data["motor_temperature"] = np.maximum(temps[0:58:2], temps[1:58:2])  # shape (29,)
+
+        with data_lock:
+            data_csv_dicts[0].update(next_data)
 
 def main(args) -> None:
     global \
@@ -236,13 +263,14 @@ def main(args) -> None:
         socket = context.socket(zmq.SUB)
         socket.connect(args.realtime_debug_url)
         socket.setsockopt(zmq.SUBSCRIBE, args.realtime_debug_topic.encode())
+        data_lock = threading.Lock()
 
         data_csv_dicts = [{
             "dof": np.zeros((1,29), dtype=np.float64),
-            "root_rot": np.array([[0.0, 0.0, 0.0, 1.0]]),  # [x, y, z, w]
+            "root_rot": np.array([[1.0, 0.0, 0.0, 0.0]]),  # [w, x, y, z]
             "root_trans_offset": np.array([[0.0, 0.0, .9]], dtype=np.float64),
             "dof_measured": np.zeros((1,29), dtype=np.float64),
-            "root_rot_measured": np.array([[0.0, 0.0, 0.0, 1.0]]),
+            "root_rot_measured": np.array([[1.0, 0.0, 0.0, 0.0]]),
             "root_trans_offset_measured": np.array([[0.0, 0.0, 0.0]], dtype=np.float64),
             "vr_3point_position": np.zeros((3,3), dtype=np.float64),
             "vr_3point_orientation": np.zeros((3,4), dtype=np.float64),
@@ -250,17 +278,25 @@ def main(args) -> None:
             "motor_temperature": np.zeros(29, dtype=np.float64),
         }]
 
-        threading.Thread(target=receive_realtime_debug_messages, args=(socket, data_csv_dicts, args.realtime_debug_topic)).start()
+        threading.Thread(
+            target=receive_realtime_debug_messages,
+            args=(socket, data_csv_dicts, args.realtime_debug_topic, data_lock),
+            daemon=True,
+        ).start()
 
     elif args.motion_dir:
         data_csv_dicts = load_anim_data(args.motion_dir)
+        data_lock = threading.Lock()
     elif args.csv_path:
         data_csv_dicts = load_anim_data(args.csv_path)
+        data_lock = threading.Lock()
     else:
         raise ValueError("Either --realtime_debug_url, --motion_dir, or --csv_path must be provided")
 
     RECORDING = False
     mj_model.opt.timestep = dt
+    mj_model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_CONTACT)
+    mj_model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_CONSTRAINT)
     try:
         context = mujoco.GLContext(1920, 1080)
         context.make_current()
@@ -282,22 +318,26 @@ def main(args) -> None:
         viewer.cam.elevation = -20.0  # Set elevation angle
         
         while viewer.is_running():
-            motion_len = data_csv_dicts[anim_idx % len(data_csv_dicts)]["dof"].shape[0]
+            with data_lock:
+                data_dict = {
+                    key: value.copy() if isinstance(value, np.ndarray) else value
+                    for key, value in data_csv_dicts[anim_idx % len(data_csv_dicts)].items()
+                }
+            motion_len = data_dict["dof"].shape[0]
             step_start = time.time()
             time_idx = frame_idx % motion_len
-            data_dict = data_csv_dicts[anim_idx % len(data_csv_dicts)]
             mj_data.qpos[:3] = data_dict["root_trans_offset"][time_idx]
-            mj_data.qpos[3:7] = data_dict["root_rot"][time_idx]
+            mj_data.qpos[3:7] = normalize_quat_wxyz(data_dict["root_rot"][time_idx])
             mj_data.qpos[7:7+29] = data_dict["dof"][time_idx]
 
             if "dof_measured" in data_dict:
                 mj_data.qpos[36:36+3] = data_dict["root_trans_offset_measured"][time_idx]
-                mj_data.qpos[39:39+4] = data_dict["root_rot_measured"][time_idx]
+                mj_data.qpos[39:39+4] = normalize_quat_wxyz(data_dict["root_rot_measured"][time_idx])
                 mj_data.qpos[43:43+29] = data_dict["dof_measured"][time_idx]
 
 
                 mj_data.qpos[43+29:43+29+3] = data_dict["root_trans_offset_measured"][time_idx]
-                mj_data.qpos[43+29+3:43+29+3+4] = data_dict["root_rot"][time_idx]
+                mj_data.qpos[43+29+3:43+29+3+4] = normalize_quat_wxyz(data_dict["root_rot"][time_idx])
                 mj_data.qpos[43+29+3+4:43+29+3+4+29] = data_dict["dof"][time_idx]
 
                 # Robot 4: temperature visualization (copy measured state, offset 3m on y)
@@ -305,10 +345,10 @@ def main(args) -> None:
                 r4_pos = data_dict["root_trans_offset_measured"][time_idx].copy()
                 r4_pos[1] -= 1.0  # offset 1m to the right
                 mj_data.qpos[r4_base:r4_base+3] = r4_pos
-                mj_data.qpos[r4_base+3:r4_base+7] = data_dict["root_rot_measured"][time_idx]
+                mj_data.qpos[r4_base+3:r4_base+7] = normalize_quat_wxyz(data_dict["root_rot_measured"][time_idx])
                 mj_data.qpos[r4_base+7:r4_base+36] = data_dict["dof_measured"][time_idx]
 
-            mujoco.mj_forward(mj_model, mj_data)
+            mujoco.mj_kinematics(mj_model, mj_data)
             if not paused:
                 frame_idx += 1
             
